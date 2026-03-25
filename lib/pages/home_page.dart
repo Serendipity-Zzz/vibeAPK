@@ -1,18 +1,17 @@
-
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
-import 'package:permission_handler/permission_handler.dart';
+
+import '../models/lyric_line.dart';
 import '../services/audio_player_service.dart';
 import '../services/lrc_service.dart';
 import '../services/lyric_scroll_service.dart';
 import '../services/recorder_service.dart';
-import '../models/lyric_line.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
   @override
-  HomePageState createState() => HomePageState();
+  State<HomePage> createState() => HomePageState();
 }
 
 class HomePageState extends State<HomePage> {
@@ -33,12 +32,14 @@ class HomePageState extends State<HomePage> {
     super.initState();
     _recorderService.init();
     _audioPlayerService.positionStream.listen((position) {
-      if (_lyrics.isNotEmpty) {
-        final newIndex = _findCurrentLyricIndex(position.inMilliseconds);
-        if (newIndex != _currentLyricIndex) {
-          setState(() => _currentLyricIndex = newIndex);
-          _lyricScrollService.scrollTo(newIndex, 60.0);
-        }
+      if (_lyrics.isEmpty) {
+        return;
+      }
+
+      final newIndex = _findCurrentLyricIndex(position.inMilliseconds);
+      if (newIndex != _currentLyricIndex && mounted) {
+        setState(() => _currentLyricIndex = newIndex);
+        _lyricScrollService.scrollTo(newIndex, 60.0);
       }
     });
   }
@@ -52,40 +53,48 @@ class HomePageState extends State<HomePage> {
     super.dispose();
   }
 
-  /// 带权限检查的音频文件选择
-  Future<void> _pickAudioWithPermissions() async {
-    debugPrint("Import button pressed. Checking permissions...");
-    var status = await Permission.audio.request();
-    if (!status.isGranted) {
-      status = await Permission.storage.request();
-    }
+  Future<void> _importAudio() async {
+    debugPrint('Import button pressed.');
 
-    if (status.isGranted) {
-      debugPrint("Permissions granted. Picking file...");
+    try {
       final path = await _audioPlayerService.pickAndLoadAudio();
-      if (path != null) {
-        setState(() {
-          _songIdentifier = path.split('/').last.split('.').first;
-          debugPrint("UI updated with new song: $_songIdentifier");
-        });
+      if (!mounted) {
+        return;
       }
-    } else if (status.isPermanentlyDenied) {
-      debugPrint("Permissions permanently denied. Opening app settings...");
-      openAppSettings();
-    } else {
-      debugPrint("Permissions denied.");
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('需要存储权限才能导入伴奏')),
-        );
+
+      if (path == null) {
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(const SnackBar(content: Text('未选择伴奏文件')));
+        return;
       }
+
+      final fileName = path.split(RegExp(r'[\\/]')).last;
+      final extensionIndex = fileName.lastIndexOf('.');
+      final songIdentifier =
+          extensionIndex > 0 ? fileName.substring(0, extensionIndex) : fileName;
+
+      setState(() => _songIdentifier = songIdentifier);
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('已导入伴奏：$songIdentifier')));
+    } catch (error) {
+      debugPrint('Failed to import audio: $error');
+      if (!mounted) {
+        return;
+      }
+
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('导入伴奏失败：$error')));
     }
   }
 
   int _findCurrentLyricIndex(int milliseconds) {
     for (int i = 0; i < _lyrics.length; i++) {
       if (milliseconds >= _lyrics[i].timestamp) {
-        if (i + 1 >= _lyrics.length || milliseconds < _lyrics[i + 1].timestamp) {
+        if (i + 1 >= _lyrics.length ||
+            milliseconds < _lyrics[i + 1].timestamp) {
           return i;
         }
       }
@@ -93,28 +102,38 @@ class HomePageState extends State<HomePage> {
     return -1;
   }
 
-  void _searchAndLoadLrc() async {
-    final songName = _songController.text;
-    if (songName.isEmpty) return;
+  Future<void> _searchAndLoadLrc() async {
+    final songName = _songController.text.trim();
+    if (songName.isEmpty) {
+      return;
+    }
 
     final lrcUrl = await _lrcService.searchLrc(songName, 'any');
-    if (lrcUrl != null) {
-      final lrcPath = await _lrcService.downloadAndSaveLrc(lrcUrl, songName);
-      if (lrcPath != null) {
-        final lyrics = await _lrcService.loadLrcFromFile(lrcPath);
-        final offset = await _lyricScrollService.loadLyricOffset(songName);
-        setState(() {
-          _lyrics = lyrics;
-          _lyricOffsetMs = offset;
-          _songIdentifier = songName;
-        });
-        _lyricScrollService.applyOffset(_lyrics, _lyricOffsetMs);
-      }
+    if (lrcUrl == null) {
+      return;
     }
+
+    final lrcPath = await _lrcService.downloadAndSaveLrc(lrcUrl, songName);
+    if (lrcPath == null) {
+      return;
+    }
+
+    final lyrics = await _lrcService.loadLrcFromFile(lrcPath);
+    final offset = await _lyricScrollService.loadLyricOffset(songName);
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _lyrics = lyrics;
+      _lyricOffsetMs = offset;
+      _songIdentifier = songName;
+    });
+    _lyricScrollService.applyOffset(_lyrics, _lyricOffsetMs);
   }
 
   void _showAlignmentDialog() {
-    showModalBottomSheet(
+    showModalBottomSheet<void>(
       context: context,
       builder: (context) {
         return StatefulBuilder(
@@ -124,11 +143,16 @@ class HomePageState extends State<HomePage> {
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Text('歌词对齐', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const Text(
+                    '歌词对齐',
+                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
                   const SizedBox(height: 10),
                   Text('偏移量: ${(_lyricOffsetMs / 1000).toStringAsFixed(2)} s'),
                   Slider(
-                    min: -10000, max: 10000, divisions: 400,
+                    min: -10000,
+                    max: 10000,
+                    divisions: 400,
                     label: '${(_lyricOffsetMs / 1000).toStringAsFixed(2)}s',
                     value: _lyricOffsetMs.toDouble(),
                     onChanged: (value) {
@@ -140,18 +164,24 @@ class HomePageState extends State<HomePage> {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                     children: [
-                      ElevatedButton(onPressed: _audioPlayerService.play, child: const Text('播放预览')),
+                      ElevatedButton(
+                        onPressed: _audioPlayerService.play,
+                        child: const Text('播放预览'),
+                      ),
                       ElevatedButton(
                         onPressed: () {
                           if (_songIdentifier != null) {
-                            _lyricScrollService.saveLyricOffset(_songIdentifier!, _lyricOffsetMs);
+                            _lyricScrollService.saveLyricOffset(
+                              _songIdentifier!,
+                              _lyricOffsetMs,
+                            );
                           }
                           Navigator.pop(context);
                         },
                         child: const Text('确认保存'),
                       ),
                     ],
-                  )
+                  ),
                 ],
               ),
             );
@@ -198,7 +228,7 @@ class HomePageState extends State<HomePage> {
           ElevatedButton.icon(
             icon: const Icon(Icons.music_note),
             label: const Text('导入伴奏'),
-            onPressed: _pickAudioWithPermissions, // 使用新的带权限检查的方法
+            onPressed: _importAudio,
           ),
           const SizedBox(width: 10),
           Expanded(
@@ -223,7 +253,12 @@ class HomePageState extends State<HomePage> {
   Widget _buildLyricView() {
     return Expanded(
       child: _lyrics.isEmpty
-          ? Center(child: Text('请先导入伴奏并搜索歌词', style: TextStyle(color: Colors.grey[400])))
+          ? Center(
+              child: Text(
+                '请先导入伴奏并搜索歌词',
+                style: TextStyle(color: Colors.grey[400]),
+              ),
+            )
           : ListView.builder(
               controller: _lyricScrollService.scrollController,
               itemCount: _lyrics.length,
@@ -238,7 +273,8 @@ class HomePageState extends State<HomePage> {
                     style: TextStyle(
                       fontSize: isCurrent ? 20 : 16,
                       color: isCurrent ? Colors.white : Colors.grey[600],
-                      fontWeight: isCurrent ? FontWeight.bold : FontWeight.normal,
+                      fontWeight:
+                          isCurrent ? FontWeight.bold : FontWeight.normal,
                     ),
                   ),
                 );
@@ -254,18 +290,25 @@ class HomePageState extends State<HomePage> {
         children: [
           StreamBuilder<Duration?>(
             stream: _audioPlayerService.durationStream,
-            builder: (context, snapshot) {
-              final duration = snapshot.data ?? Duration.zero;
+            builder: (context, durationSnapshot) {
+              final duration = durationSnapshot.data ?? Duration.zero;
               return StreamBuilder<Duration>(
                 stream: _audioPlayerService.positionStream,
-                builder: (context, snapshot) {
-                  var position = snapshot.data ?? Duration.zero;
-                  if (position > duration) position = duration;
+                builder: (context, positionSnapshot) {
+                  var position = positionSnapshot.data ?? Duration.zero;
+                  if (position > duration) {
+                    position = duration;
+                  }
+
                   return Slider(
                     min: 0.0,
                     max: duration.inMilliseconds.toDouble(),
                     value: position.inMilliseconds.toDouble(),
-                    onChanged: (value) => _audioPlayerService.seek(Duration(milliseconds: value.round())),
+                    onChanged: (value) {
+                      _audioPlayerService.seek(
+                        Duration(milliseconds: value.round()),
+                      );
+                    },
                     activeColor: Colors.white,
                     inactiveColor: Colors.grey[700],
                   );
@@ -287,22 +330,35 @@ class HomePageState extends State<HomePage> {
                   final playerState = snapshot.data;
                   final playing = playerState?.playing ?? false;
                   return IconButton(
-                    icon: Icon(playing ? Icons.pause_circle_filled : Icons.play_circle_filled, color: Colors.white),
+                    icon: Icon(
+                      playing
+                          ? Icons.pause_circle_filled
+                          : Icons.play_circle_filled,
+                      color: Colors.white,
+                    ),
                     iconSize: 64.0,
                     onPressed: () async {
+                      final messenger = ScaffoldMessenger.of(context);
                       if (playing) {
-                        _audioPlayerService.pause();
+                        await _audioPlayerService.pause();
                         final path = await _recorderService.stopRecording();
                         if (path != null && mounted) {
-                          // ignore: use_build_context_synchronously
-                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('录音已保存: $path')));
+                          messenger.showSnackBar(
+                            SnackBar(content: Text('录音已保存: $path')),
+                          );
                         }
-                        setState(() => _isRecording = false);
+                        if (mounted) {
+                          setState(() => _isRecording = false);
+                        }
                       } else {
-                        _audioPlayerService.play();
+                        await _audioPlayerService.play();
                         if (_songIdentifier != null) {
-                          await _recorderService.startRecording(_songIdentifier!);
-                          setState(() => _isRecording = true);
+                          await _recorderService.startRecording(
+                            _songIdentifier!,
+                          );
+                          if (mounted) {
+                            setState(() => _isRecording = true);
+                          }
                         }
                       }
                     },
@@ -315,7 +371,7 @@ class HomePageState extends State<HomePage> {
                   return PopupMenuButton<double>(
                     icon: const Icon(Icons.volume_up, color: Colors.white),
                     onSelected: _audioPlayerService.setVolume,
-                    itemBuilder: (context) => [
+                    itemBuilder: (context) => const [
                       PopupMenuItem(value: 0.0, child: Text('静音')),
                       PopupMenuItem(value: 0.5, child: Text('50%')),
                       PopupMenuItem(value: 1.0, child: Text('100%')),
