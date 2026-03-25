@@ -35,11 +35,14 @@ class AudioPlayerService {
 
     final filePath = result.files.single.path!;
     debugPrint('File picked: $filePath');
+    await loadAudioFromPath(filePath);
+    return filePath;
+  }
 
+  Future<void> loadAudioFromPath(String filePath) async {
     try {
       await _audioPlayer.setFilePath(filePath);
-      debugPrint('Audio source set successfully.');
-      return filePath;
+      debugPrint('Audio source set successfully: $filePath');
     } catch (error, stackTrace) {
       debugPrint('Failed to load audio file: $error');
       debugPrint('$stackTrace');

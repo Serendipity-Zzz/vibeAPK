@@ -1,15 +1,12 @@
-import 'dart:io';
-
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 
 import '../models/lyric_line.dart';
 import '../services/audio_player_service.dart';
+import '../services/gequhai_service.dart';
 import '../services/lrc_service.dart';
 import '../services/lyric_scroll_service.dart';
 import '../services/recorder_service.dart';
-import '../widgets/lyricsify_verification_dialog.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -25,14 +22,15 @@ class HomePageState extends State<HomePage> {
   final RecorderService _recorderService = RecorderService();
   final TextEditingController _songController = TextEditingController();
 
+  late final GequhaiService _gequhaiService =
+      GequhaiService(lrcService: _lrcService);
+
   String? _songIdentifier;
   List<LyricLine> _lyrics = <LyricLine>[];
   int _currentLyricIndex = -1;
   int _lyricOffsetMs = 0;
   bool _isRecording = false;
-
-  bool get _supportsEmbeddedLyricsifyVerification =>
-      !kIsWeb && Platform.isWindows;
+  bool _isSearching = false;
 
   @override
   void initState() {
@@ -72,113 +70,125 @@ class HomePageState extends State<HomePage> {
         return;
       }
 
-      final fileName = path.split(RegExp(r'[\\/]')).last;
-      final extensionIndex = fileName.lastIndexOf('.');
-      final songIdentifier =
-          extensionIndex > 0 ? fileName.substring(0, extensionIndex) : fileName;
-
+      final songIdentifier = _fileNameWithoutExtension(path);
       setState(() => _songIdentifier = songIdentifier);
-      _showMessage('已导入伴奏：$songIdentifier');
+      _showMessage('已导入本地伴奏：$songIdentifier');
     } catch (error) {
-      debugPrint('Failed to import audio: $error');
       if (mounted) {
         _showMessage('导入伴奏失败：$error');
       }
     }
   }
 
-  int _findCurrentLyricIndex(int milliseconds) {
-    for (int i = 0; i < _lyrics.length; i++) {
-      if (milliseconds >= _lyrics[i].timestamp) {
-        if (i + 1 >= _lyrics.length ||
-            milliseconds < _lyrics[i + 1].timestamp) {
-          return i;
+  Future<void> _importLrcFromLocal() async {
+    try {
+      final path = await _lrcService.pickLrcFile();
+      if (path == null) {
+        if (mounted) {
+          _showMessage('未选择歌词文件');
         }
+        return;
+      }
+
+      final fallbackName = _songIdentifier ?? _currentSearchKeyword();
+      final songName = fallbackName.isNotEmpty
+          ? fallbackName
+          : _fileNameWithoutExtension(path);
+      await _loadLyricsFromFile(songName, path);
+    } catch (error) {
+      if (mounted) {
+        _showMessage('导入本地歌词失败：$error');
       }
     }
-    return -1;
   }
 
-  Future<void> _searchAndLoadLrc() async {
-    final songName = _currentSearchKeyword();
-    if (songName.isEmpty) {
-      _showMessage('请输入歌曲名后再搜索歌词');
+  Future<void> _searchAndImportAudio() async {
+    final detail = await _searchSongDetail();
+    if (detail == null) {
       return;
     }
 
     try {
-      final lrcUrl = await _lrcService.searchLrc(songName, 'any');
-      if (lrcUrl == null) {
-        _showMessage('未在 Lyricsify 找到可用的 LRC 歌词');
+      final downloadResult = await _gequhaiService.downloadAndSaveAudio(
+        detail,
+        fileName: detail.songIdentifier,
+      );
+      if (downloadResult == null) {
+        _showMessage('未获取到可导入的伴奏音频');
         return;
       }
 
-      final lrcPath = await _lrcService.downloadAndSaveLrc(lrcUrl, songName);
-      if (lrcPath == null) {
-        final imported = await _openLyricsifyVerificationDialog(
-          songName,
-          initialUrl: lrcUrl,
-        );
-        if (!imported && mounted) {
-          _showMessage('当前页面没有识别到可导入的时间轴歌词');
-        }
+      await _audioPlayerService.loadAudioFromPath(downloadResult.filePath);
+      if (!mounted) {
         return;
       }
 
-      await _loadLyricsFromFile(songName, lrcPath);
-    } on LyricsFetchException catch (error) {
-      if (error.requiresVerification) {
-        final imported = await _openLyricsifyVerificationDialog(
-          songName,
-          initialUrl: error.verificationUrl ?? _lrcService.buildSearchUrl(songName),
-        );
-        if (!imported && mounted && !_supportsEmbeddedLyricsifyVerification) {
-          _showMessage(error.message);
-        }
-        return;
-      }
-
-      if (mounted) {
-        _showMessage(error.message);
-      }
+      setState(() => _songIdentifier = detail.songIdentifier);
+      final qualityText = downloadResult.usedHighQuality ? '高品质' : '标准音质';
+      final warning = downloadResult.warningMessage;
+      _showMessage(
+        warning == null
+            ? '已搜索导入$qualityText伴奏：${detail.songIdentifier}'
+            : '已导入伴奏：${detail.songIdentifier}；$warning',
+      );
     } catch (error) {
-      debugPrint('Failed to search lyrics: $error');
       if (mounted) {
-        _showMessage('搜索歌词失败：$error');
+        _showMessage('搜索导入伴奏失败：$error');
       }
     }
   }
 
-  Future<bool> _openLyricsifyVerificationDialog(
-    String songName, {
-    required String initialUrl,
-  }) async {
-    if (!_supportsEmbeddedLyricsifyVerification) {
-      return false;
+  Future<void> _searchAndLoadLrc() async {
+    final detail = await _searchSongDetail();
+    if (detail == null) {
+      return;
     }
 
-    if (!mounted) {
-      return false;
+    try {
+      final lrcPath = await _gequhaiService.downloadAndSaveLrc(
+        detail,
+        fileName: detail.songIdentifier,
+      );
+      if (lrcPath == null) {
+        _showMessage('未找到可导入的 LRC 歌词');
+        return;
+      }
+
+      await _loadLyricsFromFile(detail.songIdentifier, lrcPath);
+    } catch (error) {
+      if (mounted) {
+        _showMessage('搜索导入歌词失败：$error');
+      }
+    }
+  }
+
+  Future<GequhaiSongDetail?> _searchSongDetail() async {
+    final songName = _currentSearchKeyword();
+    if (songName.isEmpty) {
+      _showMessage('请输入歌曲名后再搜索');
+      return null;
     }
 
-    final lrcPath = await showDialog<String>(
-      context: context,
-      barrierDismissible: true,
-      builder: (dialogContext) {
-        return LyricsifyVerificationDialog(
-          lrcService: _lrcService,
-          songName: songName,
-          initialUrl: initialUrl,
-        );
-      },
-    );
-
-    if (lrcPath == null) {
-      return false;
+    setState(() => _isSearching = true);
+    try {
+      final detail = await _gequhaiService.searchSong(songName, 'any');
+      if (detail == null) {
+        if (mounted) {
+          _showMessage('未在歌曲海找到匹配的歌曲');
+        }
+        return null;
+      }
+      return detail;
+    } catch (error) {
+      if (mounted) {
+        _showMessage('搜索歌曲失败：$error');
+      }
+      return null;
+    } finally {
+      if (mounted) {
+        setState(() => _isSearching = false);
+      }
     }
-
-    await _loadLyricsFromFile(songName, lrcPath);
-    return true;
   }
 
   Future<void> _loadLyricsFromFile(String songName, String lrcPath) async {
@@ -213,6 +223,12 @@ class HomePageState extends State<HomePage> {
     return _songIdentifier ?? '';
   }
 
+  String _fileNameWithoutExtension(String path) {
+    final fileName = path.split(RegExp(r'[\\/]')).last;
+    final extensionIndex = fileName.lastIndexOf('.');
+    return extensionIndex > 0 ? fileName.substring(0, extensionIndex) : fileName;
+  }
+
   void _showMessage(String message) {
     if (!mounted) {
       return;
@@ -221,6 +237,18 @@ class HomePageState extends State<HomePage> {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text(message)),
     );
+  }
+
+  int _findCurrentLyricIndex(int milliseconds) {
+    for (int i = 0; i < _lyrics.length; i++) {
+      if (milliseconds >= _lyrics[i].timestamp) {
+        if (i + 1 >= _lyrics.length ||
+            milliseconds < _lyrics[i + 1].timestamp) {
+          return i;
+        }
+      }
+    }
+    return -1;
   }
 
   void _showAlignmentDialog() {
@@ -314,32 +342,64 @@ class HomePageState extends State<HomePage> {
   Widget _buildTopControls() {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10.0),
-      child: Row(
+      child: Column(
         children: <Widget>[
-          ElevatedButton.icon(
-            icon: const Icon(Icons.music_note),
-            label: const Text('导入伴奏'),
-            onPressed: _importAudio,
-          ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: TextField(
-              controller: _songController,
-              style: const TextStyle(color: Colors.white),
-              decoration: InputDecoration(
-                hintText: '搜索歌词',
-                hintStyle: TextStyle(color: Colors.grey[400]),
-                helperText: _supportsEmbeddedLyricsifyVerification
-                    ? 'Lyricsify 若触发验证，会弹出内置浏览器辅助导入'
-                    : null,
-                helperStyle: TextStyle(color: Colors.grey[500]),
-                suffixIcon: IconButton(
-                  icon: const Icon(Icons.search, color: Colors.white),
-                  onPressed: _searchAndLoadLrc,
+          Row(
+            children: <Widget>[
+              Expanded(
+                child: TextField(
+                  controller: _songController,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: InputDecoration(
+                    hintText: '输入歌名或 歌名 歌手',
+                    hintStyle: TextStyle(color: Colors.grey[400]),
+                    helperText: '搜索源：歌曲海（Gequhai）',
+                    helperStyle: TextStyle(color: Colors.grey[500]),
+                    suffixIcon: _isSearching
+                        ? const Padding(
+                            padding: EdgeInsets.all(14),
+                            child: SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                          )
+                        : IconButton(
+                            icon: const Icon(Icons.search, color: Colors.white),
+                            onPressed: _searchAndLoadLrc,
+                          ),
+                  ),
+                  onSubmitted: (_) => _searchAndLoadLrc(),
                 ),
               ),
-              onSubmitted: (_) => _searchAndLoadLrc(),
-            ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: <Widget>[
+              ElevatedButton.icon(
+                icon: const Icon(Icons.library_music),
+                label: const Text('本地导入伴奏'),
+                onPressed: _importAudio,
+              ),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.cloud_download),
+                label: const Text('搜索导入伴奏'),
+                onPressed: _isSearching ? null : _searchAndImportAudio,
+              ),
+              ElevatedButton.icon(
+                icon: const Icon(Icons.lyrics),
+                label: const Text('搜索导入歌词'),
+                onPressed: _isSearching ? null : _searchAndLoadLrc,
+              ),
+              OutlinedButton.icon(
+                icon: const Icon(Icons.upload_file),
+                label: const Text('本地导入 LRC'),
+                onPressed: _importLrcFromLocal,
+              ),
+            ],
           ),
         ],
       ),
@@ -351,7 +411,7 @@ class HomePageState extends State<HomePage> {
       child: _lyrics.isEmpty
           ? Center(
               child: Text(
-                '请先导入伴奏并搜索歌词',
+                '请先导入伴奏并导入歌词',
                 style: TextStyle(color: Colors.grey[400]),
               ),
             )
@@ -399,7 +459,9 @@ class HomePageState extends State<HomePage> {
                   return Slider(
                     min: 0.0,
                     max: duration.inMilliseconds.toDouble(),
-                    value: position.inMilliseconds.toDouble(),
+                    value: duration.inMilliseconds == 0
+                        ? 0
+                        : position.inMilliseconds.toDouble(),
                     onChanged: (value) {
                       _audioPlayerService.seek(
                         Duration(milliseconds: value.round()),
@@ -416,7 +478,7 @@ class HomePageState extends State<HomePage> {
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: <Widget>[
               IconButton(
-                icon: const Icon(Icons.mic, color: Colors.white),
+                icon: const Icon(Icons.tune, color: Colors.white),
                 onPressed: _showAlignmentDialog,
                 tooltip: '歌词对齐',
               ),
@@ -462,19 +524,14 @@ class HomePageState extends State<HomePage> {
                   );
                 },
               ),
-              StreamBuilder<double>(
-                stream: _audioPlayerService.audioPlayer.volumeStream,
-                builder: (context, snapshot) {
-                  return PopupMenuButton<double>(
-                    icon: const Icon(Icons.volume_up, color: Colors.white),
-                    onSelected: _audioPlayerService.setVolume,
-                    itemBuilder: (context) => const <PopupMenuEntry<double>>[
-                      PopupMenuItem(value: 0.0, child: Text('静音')),
-                      PopupMenuItem(value: 0.5, child: Text('50%')),
-                      PopupMenuItem(value: 1.0, child: Text('100%')),
-                    ],
-                  );
-                },
+              PopupMenuButton<double>(
+                icon: const Icon(Icons.volume_up, color: Colors.white),
+                onSelected: _audioPlayerService.setVolume,
+                itemBuilder: (context) => const <PopupMenuEntry<double>>[
+                  PopupMenuItem(value: 0.0, child: Text('静音')),
+                  PopupMenuItem(value: 0.5, child: Text('50%')),
+                  PopupMenuItem(value: 1.0, child: Text('100%')),
+                ],
               ),
             ],
           ),
