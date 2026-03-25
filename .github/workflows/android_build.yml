@@ -4,7 +4,7 @@ name: Build Flutter Android APK
 on:
   push:
     branches:
-      - main
+      - master
 
 jobs:
   build:
