@@ -9,7 +9,7 @@ import '../services/recorder_service.dart';
 import '../models/lyric_line.dart';
 
 class HomePage extends StatefulWidget {
-  const HomePage({Key? key}) : super(key: key);
+  const HomePage({super.key});
 
   @override
   _HomePageState createState() => _HomePageState();
@@ -54,24 +54,26 @@ class _HomePageState extends State<HomePage> {
 
   /// 带权限检查的音频文件选择
   Future<void> _pickAudioWithPermissions() async {
-    // 检查并请求权限
+    debugPrint("Import button pressed. Checking permissions...");
     var status = await Permission.audio.request();
-    // 对于旧版 Android，如果 audio 权限不可用，则回退到 storage 权限
     if (!status.isGranted) {
       status = await Permission.storage.request();
     }
 
     if (status.isGranted) {
-      // 权限被授予，执行文件选择
+      debugPrint("Permissions granted. Picking file...");
       final path = await _audioPlayerService.pickAndLoadAudio();
       if (path != null) {
-        setState(() => _songIdentifier = path.split('/').last.split('.').first);
+        setState(() {
+          _songIdentifier = path.split('/').last.split('.').first;
+          debugPrint("UI updated with new song: $_songIdentifier");
+        });
       }
     } else if (status.isPermanentlyDenied) {
-      // 如果权限被永久拒绝，引导用户到设置中开启
+      debugPrint("Permissions permanently denied. Opening app settings...");
       openAppSettings();
     } else {
-      // 权限被拒绝
+      debugPrint("Permissions denied.");
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('需要存储权限才能导入伴奏')),

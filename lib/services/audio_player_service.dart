@@ -27,6 +27,7 @@ class AudioPlayerService {
   /// 支持的文件类型: mp3, m4a, wav。
   /// 如果用户成功选择文件，则返回文件路径，否则返回 null。
   Future<String?> pickAndLoadAudio() async {
+    debugPrint("Attempting to pick a file..."); // 调试信息
     try {
       // 使用 file_picker 选择文件
       FilePickerResult? result = await FilePicker.platform.pickFiles(
@@ -36,14 +37,19 @@ class AudioPlayerService {
 
       if (result != null && result.files.single.path != null) {
         final filePath = result.files.single.path!;
+        debugPrint("File picked: $filePath"); // 调试信息
         // 设置音频源
         await _audioPlayer.setFilePath(filePath);
+        debugPrint("Audio source set successfully."); // 调试信息
         return filePath;
+      } else {
+        debugPrint("File picker was cancelled or failed."); // 调试信息
+        return null;
       }
     } catch (e) {
-      debugPrint("文件选择或加载失败: $e");
+      debugPrint("Error picking or loading file: $e"); // 调试信息
+      return null;
     }
-    return null;
   }
 
   /// 播放音频。
