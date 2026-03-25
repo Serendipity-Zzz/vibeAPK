@@ -103,18 +103,34 @@ class HomePageState extends State<HomePage> {
   }
 
   Future<void> _searchAndLoadLrc() async {
-    final songName = _songController.text.trim();
+    final messenger = ScaffoldMessenger.of(context);
+    final songName = _songController.text.trim().isEmpty
+        ? (_songIdentifier ?? '')
+        : _songController.text.trim();
     if (songName.isEmpty) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('请输入歌曲名后再搜索歌词')),
+      );
       return;
     }
 
     final lrcUrl = await _lrcService.searchLrc(songName, 'any');
     if (lrcUrl == null) {
+      if (mounted) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('未在歌词易找到可用的 LRC 歌词')),
+        );
+      }
       return;
     }
 
     final lrcPath = await _lrcService.downloadAndSaveLrc(lrcUrl, songName);
     if (lrcPath == null) {
+      if (mounted) {
+        messenger.showSnackBar(
+          const SnackBar(content: Text('歌词下载失败，或该页面没有可用时间轴')),
+        );
+      }
       return;
     }
 
@@ -130,6 +146,9 @@ class HomePageState extends State<HomePage> {
       _songIdentifier = songName;
     });
     _lyricScrollService.applyOffset(_lyrics, _lyricOffsetMs);
+    messenger.showSnackBar(
+      SnackBar(content: Text('已导入歌词：$songName')),
+    );
   }
 
   void _showAlignmentDialog() {
@@ -353,11 +372,19 @@ class HomePageState extends State<HomePage> {
                       } else {
                         await _audioPlayerService.play();
                         if (_songIdentifier != null) {
-                          await _recorderService.startRecording(
+                          final recordingStarted =
+                              await _recorderService.startRecording(
                             _songIdentifier!,
                           );
                           if (mounted) {
-                            setState(() => _isRecording = true);
+                            setState(() => _isRecording = recordingStarted);
+                          }
+                          if (!recordingStarted) {
+                            messenger.showSnackBar(
+                              const SnackBar(
+                                content: Text('录音未启动，请检查麦克风权限和保存目录'),
+                              ),
+                            );
                           }
                         }
                       }

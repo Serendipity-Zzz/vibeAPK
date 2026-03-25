@@ -1,124 +1,133 @@
-
 import 'dart:io';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 
-/// 录音服务类，封装了录音、权限处理和文件保存的逻辑。
 class RecorderService {
   final FlutterSoundRecorder _recorder = FlutterSoundRecorder();
+
   bool _isInitialized = false;
   String? _recordingPath;
 
-  /// 获取录音器是否正在录制。
   bool get isRecording => _recorder.isRecording;
 
-  /// 初始化录音服务，包括请求权限和打开音频会话。
-  /// 
-  /// 返回 true 表示初始化成功，否则失败。
   Future<bool> init() async {
-    if (_isInitialized) return true;
+    if (_isInitialized) {
+      return true;
+    }
 
-    // 申请录音和存储权限
     final permissionsGranted = await _requestPermissions();
     if (!permissionsGranted) {
-      debugPrint("录音或存储所需权限不足");
+      debugPrint('Recorder permissions were not granted.');
       return false;
     }
 
     try {
       await _recorder.openRecorder();
       _isInitialized = true;
-      debugPrint("录音服务初始化成功");
+      debugPrint('Recorder service initialized.');
       return true;
-    } catch (e) {
-      debugPrint("录音服务初始化失败: $e");
+    } catch (error) {
+      debugPrint('Failed to initialize recorder service: $error');
       return false;
     }
   }
 
-  /// 动态申请麦克风和存储权限。
   Future<bool> _requestPermissions() async {
-    // 1. 请求麦克风权限
-    final microphoneStatus = await Permission.microphone.request();
-    if (microphoneStatus != PermissionStatus.granted) {
-      debugPrint("麦克风权限被拒绝");
+    if (kIsWeb) {
       return false;
     }
 
-    // 2. 请求存储权限，用于将录音文件保存到公共目录
-    final storageStatus = await Permission.storage.request();
-    if (storageStatus != PermissionStatus.granted) {
-      debugPrint("存储权限被拒绝，无法保存录音文件");
-      return false; // 强制要求存储权限
+    final microphoneStatus = await Permission.microphone.request();
+    if (microphoneStatus != PermissionStatus.granted) {
+      debugPrint('Microphone permission was denied.');
+      return false;
     }
 
     return true;
   }
 
-  /// 开始录制。
-  /// 
-  /// [fileName] 保存的录音文件名（不含扩展名）。
-  Future<void> startRecording(String fileName) async {
-    if (!_isInitialized) {
-      debugPrint("录音服务未初始化或权限不足");
-      return;
+  Future<bool> startRecording(String fileName) async {
+    if (!await init()) {
+      debugPrint('Recorder is not ready.');
+      return false;
     }
+
     if (_recorder.isRecording) {
-      debugPrint("已经在录制中");
-      return;
+      debugPrint('Recorder is already recording.');
+      return false;
     }
 
     try {
-      // 获取外部公共存储目录
-      final directory = await getExternalStorageDirectory();
-      if (directory == null) {
-        debugPrint("无法获取外部存储目录");
-        return;
+      final recordingsDir = await _resolveRecordingDirectory();
+      if (recordingsDir == null) {
+        debugPrint('Failed to resolve recording directory.');
+        return false;
       }
-      
-      // 在外部存储中创建一个专门的文件夹来存放录音
-      final recordingsDir = Directory('${directory.path}/KaraokeRecordings');
+
       if (!await recordingsDir.exists()) {
         await recordingsDir.create(recursive: true);
       }
 
-      // 定义录音文件的完整路径
-      _recordingPath = '${recordingsDir.path}/$fileName.wav';
-      
+      final safeFileName = _sanitizeFileName(fileName);
+      _recordingPath = '${recordingsDir.path}/$safeFileName.wav';
+
       await _recorder.startRecorder(
         toFile: _recordingPath,
-        codec: Codec.pcm16WAV, // 使用 WAV 格式
+        codec: Codec.pcm16WAV,
       );
-      debugPrint("开始录制，文件将保存至: $_recordingPath");
-    } catch (e) {
-      debugPrint("开始录制失败: $e");
+      debugPrint('Recording started: $_recordingPath');
+      return true;
+    } catch (error) {
+      debugPrint('Failed to start recording: $error');
+      _recordingPath = null;
+      return false;
     }
   }
 
-  /// 停止录制。
-  /// 
-  /// 返回录音文件的路径，如果录制未开始或失败则返回 null。
   Future<String?> stopRecording() async {
     if (!_recorder.isRecording) {
-      debugPrint("当前没有正在进行的录制");
+      debugPrint('Recorder is not currently recording.');
       return null;
     }
 
     try {
       await _recorder.stopRecorder();
-      debugPrint("录制结束，文件保存在: $_recordingPath");
       final path = _recordingPath;
-      _recordingPath = null; // 重置路径
+      _recordingPath = null;
+      debugPrint('Recording stopped. Saved to: $path');
       return path;
-    } catch (e) {
-      debugPrint("停止录制失败: $e");
+    } catch (error) {
+      debugPrint('Failed to stop recording: $error');
       return null;
     }
   }
 
-  /// 释放资源。
+  Future<Directory?> _resolveRecordingDirectory() async {
+    if (kIsWeb) {
+      return null;
+    }
+
+    if (Platform.isAndroid) {
+      final baseDir =
+          await getExternalStorageDirectory() ??
+          await getApplicationDocumentsDirectory();
+      return Directory('${baseDir.path}/KaraokeRecordings');
+    }
+
+    final baseDir = await getApplicationDocumentsDirectory();
+    return Directory('${baseDir.path}/KaraokeRecordings');
+  }
+
+  String _sanitizeFileName(String value) {
+    return value
+        .replaceAll(RegExp(r'[<>:"/\\|?*]'), '_')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
+  }
+
   void dispose() {
     if (_isInitialized) {
       _recorder.closeRecorder();
