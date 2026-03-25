@@ -1,3 +1,6 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 
@@ -6,6 +9,7 @@ import '../services/audio_player_service.dart';
 import '../services/lrc_service.dart';
 import '../services/lyric_scroll_service.dart';
 import '../services/recorder_service.dart';
+import '../widgets/lyricsify_verification_dialog.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -22,10 +26,13 @@ class HomePageState extends State<HomePage> {
   final TextEditingController _songController = TextEditingController();
 
   String? _songIdentifier;
-  List<LyricLine> _lyrics = [];
+  List<LyricLine> _lyrics = <LyricLine>[];
   int _currentLyricIndex = -1;
   int _lyricOffsetMs = 0;
   bool _isRecording = false;
+
+  bool get _supportsEmbeddedLyricsifyVerification =>
+      !kIsWeb && Platform.isWindows;
 
   @override
   void initState() {
@@ -54,8 +61,6 @@ class HomePageState extends State<HomePage> {
   }
 
   Future<void> _importAudio() async {
-    debugPrint('Import button pressed.');
-
     try {
       final path = await _audioPlayerService.pickAndLoadAudio();
       if (!mounted) {
@@ -63,9 +68,7 @@ class HomePageState extends State<HomePage> {
       }
 
       if (path == null) {
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('未选择伴奏文件')));
+        _showMessage('未选择伴奏文件');
         return;
       }
 
@@ -75,18 +78,12 @@ class HomePageState extends State<HomePage> {
           extensionIndex > 0 ? fileName.substring(0, extensionIndex) : fileName;
 
       setState(() => _songIdentifier = songIdentifier);
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('已导入伴奏：$songIdentifier')));
+      _showMessage('已导入伴奏：$songIdentifier');
     } catch (error) {
       debugPrint('Failed to import audio: $error');
-      if (!mounted) {
-        return;
+      if (mounted) {
+        _showMessage('导入伴奏失败：$error');
       }
-
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('导入伴奏失败：$error')));
     }
   }
 
@@ -103,38 +100,96 @@ class HomePageState extends State<HomePage> {
   }
 
   Future<void> _searchAndLoadLrc() async {
-    final messenger = ScaffoldMessenger.of(context);
-    final songName = _songController.text.trim().isEmpty
-        ? (_songIdentifier ?? '')
-        : _songController.text.trim();
+    final songName = _currentSearchKeyword();
     if (songName.isEmpty) {
-      messenger.showSnackBar(
-        const SnackBar(content: Text('请输入歌曲名后再搜索歌词')),
-      );
+      _showMessage('请输入歌曲名后再搜索歌词');
       return;
     }
 
-    final lrcUrl = await _lrcService.searchLrc(songName, 'any');
-    if (lrcUrl == null) {
-      if (mounted) {
-        messenger.showSnackBar(
-          const SnackBar(content: Text('未在歌词易找到可用的 LRC 歌词')),
-        );
+    try {
+      final lrcUrl = await _lrcService.searchLrc(songName, 'any');
+      if (lrcUrl == null) {
+        _showMessage('未在 Lyricsify 找到可用的 LRC 歌词');
+        return;
       }
-      return;
+
+      final lrcPath = await _lrcService.downloadAndSaveLrc(lrcUrl, songName);
+      if (lrcPath == null) {
+        final imported = await _openLyricsifyVerificationDialog(
+          songName,
+          initialUrl: lrcUrl,
+        );
+        if (!imported && mounted) {
+          _showMessage('当前页面没有识别到可导入的时间轴歌词');
+        }
+        return;
+      }
+
+      await _loadLyricsFromFile(songName, lrcPath);
+    } on LyricsFetchException catch (error) {
+      if (error.requiresVerification) {
+        final imported = await _openLyricsifyVerificationDialog(
+          songName,
+          initialUrl: error.verificationUrl ?? _lrcService.buildSearchUrl(songName),
+        );
+        if (!imported && mounted && !_supportsEmbeddedLyricsifyVerification) {
+          _showMessage(error.message);
+        }
+        return;
+      }
+
+      if (mounted) {
+        _showMessage(error.message);
+      }
+    } catch (error) {
+      debugPrint('Failed to search lyrics: $error');
+      if (mounted) {
+        _showMessage('搜索歌词失败：$error');
+      }
+    }
+  }
+
+  Future<bool> _openLyricsifyVerificationDialog(
+    String songName, {
+    required String initialUrl,
+  }) async {
+    if (!_supportsEmbeddedLyricsifyVerification) {
+      return false;
     }
 
-    final lrcPath = await _lrcService.downloadAndSaveLrc(lrcUrl, songName);
+    if (!mounted) {
+      return false;
+    }
+
+    final lrcPath = await showDialog<String>(
+      context: context,
+      barrierDismissible: true,
+      builder: (dialogContext) {
+        return LyricsifyVerificationDialog(
+          lrcService: _lrcService,
+          songName: songName,
+          initialUrl: initialUrl,
+        );
+      },
+    );
+
     if (lrcPath == null) {
+      return false;
+    }
+
+    await _loadLyricsFromFile(songName, lrcPath);
+    return true;
+  }
+
+  Future<void> _loadLyricsFromFile(String songName, String lrcPath) async {
+    final lyrics = await _lrcService.loadLrcFromFile(lrcPath);
+    if (lyrics.isEmpty) {
       if (mounted) {
-        messenger.showSnackBar(
-          const SnackBar(content: Text('歌词下载失败，或该页面没有可用时间轴')),
-        );
+        _showMessage('歌词文件已导入，但没有解析出时间轴内容');
       }
       return;
     }
 
-    final lyrics = await _lrcService.loadLrcFromFile(lrcPath);
     final offset = await _lyricScrollService.loadLyricOffset(songName);
     if (!mounted) {
       return;
@@ -144,10 +199,27 @@ class HomePageState extends State<HomePage> {
       _lyrics = lyrics;
       _lyricOffsetMs = offset;
       _songIdentifier = songName;
+      _currentLyricIndex = -1;
     });
     _lyricScrollService.applyOffset(_lyrics, _lyricOffsetMs);
-    messenger.showSnackBar(
-      SnackBar(content: Text('已导入歌词：$songName')),
+    _showMessage('已导入歌词：$songName');
+  }
+
+  String _currentSearchKeyword() {
+    final text = _songController.text.trim();
+    if (text.isNotEmpty) {
+      return text;
+    }
+    return _songIdentifier ?? '';
+  }
+
+  void _showMessage(String message) {
+    if (!mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
     );
   }
 
@@ -161,7 +233,7 @@ class HomePageState extends State<HomePage> {
               padding: const EdgeInsets.all(20.0),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
-                children: [
+                children: <Widget>[
                   const Text(
                     '歌词对齐',
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -182,7 +254,7 @@ class HomePageState extends State<HomePage> {
                   ),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                    children: [
+                    children: <Widget>[
                       ElevatedButton(
                         onPressed: _audioPlayerService.play,
                         child: const Text('播放预览'),
@@ -217,7 +289,7 @@ class HomePageState extends State<HomePage> {
         title: const Text('K 歌伴唱'),
         backgroundColor: Colors.grey[850],
         elevation: 0,
-        actions: [
+        actions: <Widget>[
           if (_isRecording)
             const Padding(
               padding: EdgeInsets.only(right: 16.0),
@@ -229,7 +301,7 @@ class HomePageState extends State<HomePage> {
       body: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 16.0),
         child: Column(
-          children: [
+          children: <Widget>[
             _buildTopControls(),
             _buildLyricView(),
             _buildBottomControls(),
@@ -243,7 +315,7 @@ class HomePageState extends State<HomePage> {
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 10.0),
       child: Row(
-        children: [
+        children: <Widget>[
           ElevatedButton.icon(
             icon: const Icon(Icons.music_note),
             label: const Text('导入伴奏'),
@@ -257,11 +329,16 @@ class HomePageState extends State<HomePage> {
               decoration: InputDecoration(
                 hintText: '搜索歌词',
                 hintStyle: TextStyle(color: Colors.grey[400]),
+                helperText: _supportsEmbeddedLyricsifyVerification
+                    ? 'Lyricsify 若触发验证，会弹出内置浏览器辅助导入'
+                    : null,
+                helperStyle: TextStyle(color: Colors.grey[500]),
                 suffixIcon: IconButton(
                   icon: const Icon(Icons.search, color: Colors.white),
                   onPressed: _searchAndLoadLrc,
                 ),
               ),
+              onSubmitted: (_) => _searchAndLoadLrc(),
             ),
           ),
         ],
@@ -306,7 +383,7 @@ class HomePageState extends State<HomePage> {
     return Padding(
       padding: const EdgeInsets.only(bottom: 20.0, top: 10.0),
       child: Column(
-        children: [
+        children: <Widget>[
           StreamBuilder<Duration?>(
             stream: _audioPlayerService.durationStream,
             builder: (context, durationSnapshot) {
@@ -337,7 +414,7 @@ class HomePageState extends State<HomePage> {
           ),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
+            children: <Widget>[
               IconButton(
                 icon: const Icon(Icons.mic, color: Colors.white),
                 onPressed: _showAlignmentDialog,
@@ -357,14 +434,11 @@ class HomePageState extends State<HomePage> {
                     ),
                     iconSize: 64.0,
                     onPressed: () async {
-                      final messenger = ScaffoldMessenger.of(context);
                       if (playing) {
                         await _audioPlayerService.pause();
                         final path = await _recorderService.stopRecording();
                         if (path != null && mounted) {
-                          messenger.showSnackBar(
-                            SnackBar(content: Text('录音已保存: $path')),
-                          );
+                          _showMessage('录音已保存：$path');
                         }
                         if (mounted) {
                           setState(() => _isRecording = false);
@@ -379,12 +453,8 @@ class HomePageState extends State<HomePage> {
                           if (mounted) {
                             setState(() => _isRecording = recordingStarted);
                           }
-                          if (!recordingStarted) {
-                            messenger.showSnackBar(
-                              const SnackBar(
-                                content: Text('录音未启动，请检查麦克风权限和保存目录'),
-                              ),
-                            );
+                          if (!recordingStarted && mounted) {
+                            _showMessage('录音未启动，请检查麦克风权限和保存目录');
                           }
                         }
                       }
@@ -398,7 +468,7 @@ class HomePageState extends State<HomePage> {
                   return PopupMenuButton<double>(
                     icon: const Icon(Icons.volume_up, color: Colors.white),
                     onSelected: _audioPlayerService.setVolume,
-                    itemBuilder: (context) => const [
+                    itemBuilder: (context) => const <PopupMenuEntry<double>>[
                       PopupMenuItem(value: 0.0, child: Text('静音')),
                       PopupMenuItem(value: 0.5, child: Text('50%')),
                       PopupMenuItem(value: 1.0, child: Text('100%')),

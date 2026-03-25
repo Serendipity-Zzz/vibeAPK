@@ -18,14 +18,30 @@ class LrcService {
                   'Chrome/145.0.0.0 Safari/537.36',
               HttpHeaders.acceptLanguageHeader: 'zh-CN,zh;q=0.9,en;q=0.8',
             },
-            validateStatus: (status) => status != null && status < 500,
+            followRedirects: true,
+            validateStatus: (status) => status != null && status < 600,
           ),
         );
 
-  static const String _baseUrl = 'https://geciyi.com';
+  static const String _baseUrl = 'https://www.lyricsify.com';
+  static final RegExp _timestampRegex = RegExp(
+    r'\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]',
+  );
+  static final RegExp _metadataRegex = RegExp(
+    r'^\[(ti|ar|al|by|offset):.*\]$',
+    caseSensitive: false,
+  );
 
   final Dio _dio;
-  final Map<String, _LyricsPageData> _pageCache = <String, _LyricsPageData>{};
+
+  String buildSearchUrl(String query) {
+    final normalizedQuery = query.trim();
+    if (normalizedQuery.isEmpty) {
+      return _baseUrl;
+    }
+
+    return '$_baseUrl/search?q=${Uri.encodeQueryComponent(normalizedQuery)}';
+  }
 
   Future<String?> searchLrc(String songName, String artist) async {
     final query = _buildSearchQuery(songName, artist);
@@ -33,73 +49,144 @@ class LrcService {
       return null;
     }
 
-    _LyricsPageData? bestMatch;
+    LyricsFetchException? verificationError;
     for (final candidate in _buildCandidateQueries(query)) {
-      final page = await _fetchLyricsPage(candidate);
-      if (page == null || !page.hasTimedLyrics) {
-        continue;
-      }
+      final searchUrl = buildSearchUrl(candidate);
+      try {
+        final html = await _requestPage(searchUrl);
+        if (html == null) {
+          continue;
+        }
 
-      if (bestMatch == null || page.score > bestMatch.score) {
-        bestMatch = page;
-      }
+        final matches = _extractLyricsLinks(html, candidate);
+        if (matches.isEmpty) {
+          continue;
+        }
 
-      if (page.score >= 120) {
-        break;
+        final bestMatch = matches.first;
+        debugPrint(
+          "Matched Lyricsify page '${bestMatch.title}' by '${bestMatch.artist}' -> ${bestMatch.url}",
+        );
+        return bestMatch.url;
+      } on LyricsFetchException catch (error) {
+        if (error.requiresVerification) {
+          verificationError ??= error;
+          break;
+        }
+        rethrow;
       }
     }
 
-    if (bestMatch == null) {
-      debugPrint("No timed lyrics found on geciyi for query: $query");
-      return null;
+    if (verificationError != null) {
+      throw verificationError;
     }
 
-    _pageCache[bestMatch.url] = bestMatch;
-    debugPrint(
-      "Matched lyrics page '${bestMatch.title}' by '${bestMatch.artist}' -> ${bestMatch.url}",
-    );
-    return bestMatch.url;
+    debugPrint("No Lyricsify result found for query: $query");
+    return null;
   }
 
   Future<String?> downloadAndSaveLrc(String url, String fileName) async {
     try {
-      final cacheDir = await getApplicationCacheDirectory();
-      final safeFileName = _sanitizeFileName(fileName);
-      final filePath = '${cacheDir.path}/$safeFileName.lrc';
-      final file = File(filePath);
-
-      if (await file.exists()) {
-        debugPrint("Using cached LRC file: $filePath");
-        return filePath;
-      }
-
-      final page = _pageCache[url] ?? await _fetchLyricsPageByUrl(url);
-      if (page == null || !page.hasTimedLyrics) {
-        debugPrint("Lyrics page does not contain timed lyrics: $url");
+      final html = await _requestPage(url);
+      if (html == null) {
         return null;
       }
 
-      final lrcContent = _buildLrcContent(page);
-      if (lrcContent.isEmpty) {
-        debugPrint("Failed to build LRC content for: $url");
+      var lrcContent = _extractLrcContent(
+        html: html,
+        pageTitle: _extractPageTitle(html),
+        fileName: fileName,
+      );
+
+      if (lrcContent == null) {
+        final lrcUrl = extractLrcDownloadUrl(html, currentUrl: url);
+        if (lrcUrl != null) {
+          final lrcResponse = await _requestPage(lrcUrl);
+          if (lrcResponse != null) {
+            lrcContent = _extractLrcContent(
+              html: lrcResponse,
+              pageTitle: _extractPageTitle(html),
+              fileName: fileName,
+            );
+          }
+        }
+      }
+
+      if (lrcContent == null) {
+        debugPrint("Lyricsify page did not expose a timed LRC payload: $url");
         return null;
       }
 
-      await file.writeAsString(lrcContent);
-      debugPrint("Saved LRC file to: $filePath");
-      return filePath;
+      return _writeLrcFile(fileName, lrcContent);
+    } on LyricsFetchException {
+      rethrow;
     } catch (error) {
-      debugPrint("Failed to download or save LRC: $error");
+      debugPrint("Failed to download or save Lyricsify LRC: $error");
       return null;
     }
   }
 
+  Future<String?> saveLrcFromPageHtml({
+    required String html,
+    required String fileName,
+    String? pageUrl,
+    String? pageTitle,
+    String? pageText,
+  }) async {
+    if (_looksLikeVerificationPage(html) ||
+        (pageText != null && _looksLikeVerificationPage(pageText))) {
+      throw LyricsFetchException(
+        'Lyricsify 当前仍在验证页，请先完成人机验证并打开歌词页面。',
+        requiresVerification: true,
+        verificationUrl: pageUrl,
+      );
+    }
+
+    final lrcContent = _extractLrcContent(
+      html: html,
+      pageText: pageText,
+      pageTitle: pageTitle,
+      fileName: fileName,
+    );
+    if (lrcContent == null) {
+      return null;
+    }
+
+    return _writeLrcFile(fileName, lrcContent);
+  }
+
+  String? extractFirstLyricsPageUrl(String html, {String? currentUrl}) {
+    final matches = _extractLyricsLinks(html, '');
+    if (matches.isEmpty) {
+      return null;
+    }
+
+    return matches.first.url;
+  }
+
+  String? extractLrcDownloadUrl(String html, {String? currentUrl}) {
+    final match = RegExp(
+      r'href="([^"]*(?:\.lrc|/lrc/[^"]+))"',
+      caseSensitive: false,
+    ).firstMatch(html);
+    if (match == null) {
+      return null;
+    }
+
+    final rawHref = _decodeHtmlEntities(match.group(1)!).trim();
+    if (rawHref.isEmpty || rawHref == '/lrc') {
+      return null;
+    }
+
+    final baseUri = Uri.parse(currentUrl ?? _baseUrl);
+    return baseUri.resolve(rawHref).toString();
+  }
+
   List<LyricLine> parseLrc(String lrcContent) {
     final List<LyricLine> lyrics = <LyricLine>[];
-    final RegExp timeRegex = RegExp(r'\[(\d{2}):(\d{2})\.(\d{2,3})\]');
 
     for (final line in lrcContent.split('\n')) {
-      final matches = timeRegex.allMatches(line);
+      final matches = _timestampRegex.allMatches(line);
       if (matches.isEmpty) {
         continue;
       }
@@ -108,9 +195,8 @@ class LrcService {
       for (final match in matches) {
         final minutes = int.parse(match.group(1)!);
         final seconds = int.parse(match.group(2)!);
-        final fraction = match.group(3)!;
-        final milliseconds =
-            fraction.length == 2 ? int.parse(fraction) * 10 : int.parse(fraction);
+        final fraction = match.group(3);
+        final milliseconds = _fractionToMilliseconds(fraction);
         final totalMilliseconds =
             minutes * 60 * 1000 + seconds * 1000 + milliseconds;
         lyrics.add(
@@ -132,6 +218,35 @@ class LrcService {
       debugPrint("Failed to load LRC from file: $error");
       return <LyricLine>[];
     }
+  }
+
+  Future<String?> _requestPage(String url) async {
+    final response = await _dio.get<String>(
+      url,
+      options: Options(responseType: ResponseType.plain),
+    );
+    final body = response.data ?? '';
+
+    if (_looksLikeVerificationPage(body, statusCode: response.statusCode)) {
+      throw LyricsFetchException(
+        'Lyricsify 触发了人机验证，请在弹出的浏览器中完成验证后再导入。',
+        requiresVerification: true,
+        verificationUrl: url,
+      );
+    }
+
+    if (response.statusCode == 404) {
+      return null;
+    }
+
+    if (response.statusCode != 200) {
+      debugPrint(
+        'Lyricsify request failed with status ${response.statusCode}: $url',
+      );
+      return null;
+    }
+
+    return body;
   }
 
   String _buildSearchQuery(String songName, String artist) {
@@ -184,175 +299,318 @@ class LrcService {
       addCandidate(words.sublist(0, end).join(' '));
     }
 
-    for (final word in words) {
-      addCandidate(word);
-    }
-
     yield* candidates;
   }
 
-  Future<_LyricsPageData?> _fetchLyricsPage(String query) async {
-    final url = '$_baseUrl/lyrics/${Uri.encodeComponent(query)}';
-    return _fetchLyricsPageByUrl(url, query: query);
-  }
+  List<_LyricsLinkCandidate> _extractLyricsLinks(String html, String query) {
+    final matches = RegExp(
+      r'<a[^>]+href="(/lyrics/[^"]+)"[^>]*>(.*?)</a>',
+      caseSensitive: false,
+      dotAll: true,
+    ).allMatches(html);
 
-  Future<_LyricsPageData?> _fetchLyricsPageByUrl(
-    String url, {
-    String? query,
-  }) async {
-    try {
-      final response = await _dio.get<String>(
-        url,
-        options: Options(responseType: ResponseType.plain),
-      );
-      if (response.statusCode != 200 || response.data == null) {
-        return null;
-      }
+    final LinkedHashMap<String, _LyricsLinkCandidate> candidates =
+        LinkedHashMap<String, _LyricsLinkCandidate>();
+    for (final match in matches) {
+      final relativeUrl = match.group(1)!;
+      final anchorHtml = match.group(2)!;
+      final title = _extractTagText(anchorHtml, 'strong');
+      final artist = _extractTagText(anchorHtml, 'small');
+      final readableText = _stripHtml(anchorHtml);
 
-      final html = response.data!;
-      final title = _extractTitle(html);
-      final artist = _extractArtist(html);
-      final lyricLines = _extractLyricLines(html);
-      final timestamps = _extractTimestamps(html);
-
-      if (title == null || lyricLines.isEmpty) {
-        return null;
-      }
-
-      return _LyricsPageData(
-        url: url,
-        title: title,
+      final candidate = _LyricsLinkCandidate(
+        url: Uri.parse(_baseUrl).resolve(relativeUrl).toString(),
+        title: title.isEmpty ? readableText : title,
         artist: artist,
-        lyricLines: lyricLines,
-        timestamps: timestamps,
         score: _calculateMatchScore(
-          query ?? '$title $artist',
-          title,
+          query,
+          title.isEmpty ? readableText : title,
           artist,
-          lyricLines.length,
-          timestamps.length,
+          relativeUrl,
         ),
       );
-    } catch (error) {
-      debugPrint("Failed to fetch lyrics page '$url': $error");
-      return null;
+
+      final existing = candidates[candidate.url];
+      if (existing == null || candidate.score > existing.score) {
+        candidates[candidate.url] = candidate;
+      }
     }
+
+    final ordered = candidates.values.toList()
+      ..sort((a, b) => b.score.compareTo(a.score));
+    return ordered;
   }
 
-  String? _extractTitle(String html) {
-    final match = RegExp(r'<h1[^>]*>(.*?)</h1>', dotAll: true).firstMatch(html);
-    if (match == null) {
-      return null;
+  String? _extractLrcContent({
+    required String html,
+    String? pageText,
+    String? pageTitle,
+    String? fileName,
+  }) {
+    final sources = <String>[
+      if (pageText != null && pageText.trim().isNotEmpty) pageText,
+      html,
+      _stripHtml(html),
+    ];
+
+    for (final source in sources) {
+      final lines = _extractLrcLines(source);
+      final timedLineCount =
+          lines.where((line) => _timestampRegex.hasMatch(line)).length;
+      if (timedLineCount < 2) {
+        continue;
+      }
+
+      return _composeLrcContent(
+        lines,
+        title: _resolveTitle(pageTitle, html, fileName),
+        artist: _resolveArtist(html),
+      );
     }
-    return _stripHtml(match.group(1)!);
+
+    return null;
   }
 
-  String _extractArtist(String html) {
-    final titleBlockMatch = RegExp(
-      r'<h1[^>]*>.*?</h1>\s*<p[^>]*>(.*?)</p>',
-      dotAll: true,
-    ).firstMatch(html);
-    if (titleBlockMatch == null) {
+  List<String> _extractLrcLines(String source) {
+    final normalized = _decodeHtmlEntities(
+      source
+          .replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n')
+          .replaceAll(
+            RegExp(r'</(div|p|li|tr|section|article|pre|span|h\d)>',
+                caseSensitive: false),
+            '\n',
+          )
+          .replaceAll(RegExp(r'<[^>]+>'), '\n')
+          .replaceAll('\\r', '')
+          .replaceAll('\\n', '\n'),
+    );
+
+    final lines = normalized
+        .split(RegExp(r'\n+'))
+        .map((line) => line.replaceAll(RegExp(r'\s+'), ' ').trim())
+        .where((line) => line.isNotEmpty)
+        .toList();
+
+    final ordered = <String>{};
+    for (final line in lines) {
+      if (_metadataRegex.hasMatch(line)) {
+        ordered.add(line);
+        continue;
+      }
+
+      if (_timestampRegex.hasMatch(line)) {
+        ordered.add(_normalizeTimedLine(line));
+      }
+    }
+
+    return ordered.toList();
+  }
+
+  String _composeLrcContent(
+    List<String> lines, {
+    required String title,
+    required String artist,
+  }) {
+    final metadataLines = lines.where(_metadataRegex.hasMatch).toList();
+    final timedLines = lines.where((line) => _timestampRegex.hasMatch(line)).toList();
+
+    final buffer = StringBuffer();
+    final hasTitle = metadataLines.any(
+      (line) => line.toLowerCase().startsWith('[ti:'),
+    );
+    final hasArtist = metadataLines.any(
+      (line) => line.toLowerCase().startsWith('[ar:'),
+    );
+    final hasBy = metadataLines.any(
+      (line) => line.toLowerCase().startsWith('[by:'),
+    );
+
+    if (!hasTitle && title.isNotEmpty) {
+      buffer.writeln('[ti:$title]');
+    }
+    if (!hasArtist && artist.isNotEmpty) {
+      buffer.writeln('[ar:$artist]');
+    }
+    if (!hasBy) {
+      buffer.writeln('[by:lyricsify.com]');
+    }
+
+    for (final line in metadataLines) {
+      final lower = line.toLowerCase();
+      if (!hasTitle && lower.startsWith('[ti:')) {
+        continue;
+      }
+      if (!hasArtist && lower.startsWith('[ar:')) {
+        continue;
+      }
+      if (!hasBy && lower.startsWith('[by:')) {
+        continue;
+      }
+      buffer.writeln(line);
+    }
+
+    if (timedLines.isNotEmpty) {
+      buffer.writeln();
+    }
+    for (final line in timedLines) {
+      buffer.writeln(line);
+    }
+
+    return buffer.toString().trim();
+  }
+
+  Future<String> _writeLrcFile(String fileName, String lrcContent) async {
+    final cacheDir = await getApplicationCacheDirectory();
+    final safeFileName = _sanitizeFileName(fileName);
+    final filePath = '${cacheDir.path}/lyricsify_$safeFileName.lrc';
+    final file = File(filePath);
+    await file.writeAsString(lrcContent);
+    debugPrint("Saved Lyricsify LRC file to: $filePath");
+    return filePath;
+  }
+
+  int _fractionToMilliseconds(String? fraction) {
+    if (fraction == null || fraction.isEmpty) {
+      return 0;
+    }
+
+    if (fraction.length == 1) {
+      return int.parse(fraction) * 100;
+    }
+    if (fraction.length == 2) {
+      return int.parse(fraction) * 10;
+    }
+    return int.parse(fraction.substring(0, 3));
+  }
+
+  String _normalizeTimedLine(String line) {
+    return line.replaceAllMapped(_timestampRegex, (match) {
+      final minutes = match.group(1)!.padLeft(2, '0');
+      final seconds = match.group(2)!;
+      final fraction = match.group(3);
+      if (fraction == null || fraction.isEmpty) {
+        return '[$minutes:$seconds.00]';
+      }
+      if (fraction.length == 1) {
+        return '[$minutes:$seconds.${fraction}00]';
+      }
+      if (fraction.length == 2) {
+        return '[$minutes:$seconds.${fraction}0]';
+      }
+      return '[$minutes:$seconds.${fraction.substring(0, 3)}]';
+    });
+  }
+
+  String _resolveTitle(String? pageTitle, String html, String? fileName) {
+    final candidates = <String>[
+      ?pageTitle,
+      _extractPageTitle(html),
+      ?fileName,
+      '',
+    ];
+
+    for (final candidate in candidates) {
+      final cleaned = candidate
+          .replaceAll(RegExp(r'\s+LRC\s+Lyrics', caseSensitive: false), '')
+          .replaceAll(RegExp(r'\s*\|\s*Lyricsify.*$', caseSensitive: false), '')
+          .replaceAll(RegExp(r'\s+-\s+Lyricsify.*$', caseSensitive: false), '')
+          .trim();
+      if (cleaned.isNotEmpty) {
+        return cleaned;
+      }
+    }
+
+    return '';
+  }
+
+  String _resolveArtist(String html) {
+    final small = _extractTagText(html, 'small');
+    if (small.isNotEmpty) {
+      return small;
+    }
+
+    final title = _extractPageTitle(html);
+    final match = RegExp(r'^(.*?)\s+-\s+(.*?)\s+LRC\s+Lyrics$',
+        caseSensitive: false).firstMatch(title);
+    if (match != null) {
+      return match.group(1)!.trim();
+    }
+
+    return '';
+  }
+
+  String _extractPageTitle(String html) {
+    final h1Match = RegExp(r'<h1[^>]*>(.*?)</h1>', dotAll: true).firstMatch(html);
+    if (h1Match != null) {
+      final title = _stripHtml(h1Match.group(1)!);
+      if (title.isNotEmpty) {
+        return title;
+      }
+    }
+
+    final titleMatch =
+        RegExp(r'<title[^>]*>(.*?)</title>', dotAll: true).firstMatch(html);
+    if (titleMatch == null) {
       return '';
     }
-    return _stripHtml(titleBlockMatch.group(1)!);
+
+    return _stripHtml(titleMatch.group(1)!);
   }
 
-  List<String> _extractLyricLines(String html) {
-    final matches = RegExp(
-      r'<div class="original-text[^"]*">(.*?)</div>',
-      dotAll: true,
-    ).allMatches(html);
-
-    final lines = matches.map((match) => _stripHtml(match.group(1)!)).toList();
-    if (lines.isNotEmpty) {
-      return lines;
-    }
-
-    final fallbackMatches = RegExp(
-      r'<div class="lyrics-line[^"]*">(.*?)</div>',
-      dotAll: true,
-    ).allMatches(html);
-
-    return fallbackMatches
-        .map((match) => _stripHtml(match.group(1)!))
-        .toList();
-  }
-
-  List<String> _extractTimestamps(String html) {
+  String _extractTagText(String html, String tagName) {
     final match = RegExp(
-      r"window\.lyrics_time\s*=\s*'([^']*)';",
+      '<$tagName[^>]*>(.*?)</$tagName>',
+      caseSensitive: false,
       dotAll: true,
     ).firstMatch(html);
     if (match == null) {
-      return <String>[];
+      return '';
     }
 
-    final raw = match.group(1)!;
-    final timestampMatches =
-        RegExp(r'\[\d{2}:\d{2}\.\d{2,3}\]').allMatches(raw).toList();
-    return timestampMatches
-        .map((timestampMatch) => timestampMatch.group(0)!)
-        .toList();
+    return _stripHtml(match.group(1)!);
   }
 
   int _calculateMatchScore(
     String query,
     String title,
     String artist,
-    int lyricCount,
-    int timestampCount,
+    String relativeUrl,
   ) {
     final normalizedQuery = _normalizeForComparison(query);
     final normalizedTitle = _normalizeForComparison(title);
     final normalizedArtist = _normalizeForComparison(artist);
+    final normalizedUrl = _normalizeForComparison(relativeUrl);
 
     int score = 0;
-    if (normalizedQuery == normalizedTitle) {
+    if (normalizedQuery.isNotEmpty && normalizedQuery == normalizedTitle) {
       score += 100;
     }
-    if (normalizedQuery.contains(normalizedTitle) && normalizedTitle.isNotEmpty) {
+    if (normalizedTitle.isNotEmpty &&
+        normalizedQuery.contains(normalizedTitle)) {
       score += 60;
     }
-    if (normalizedTitle.contains(normalizedQuery) && normalizedQuery.isNotEmpty) {
+    if (normalizedQuery.isNotEmpty &&
+        normalizedTitle.contains(normalizedQuery)) {
       score += 30;
     }
     if (normalizedArtist.isNotEmpty &&
         normalizedQuery.contains(normalizedArtist)) {
       score += 20;
     }
-    if (lyricCount > 0) {
-      score += 10;
-    }
-    if (timestampCount == lyricCount && timestampCount > 0) {
-      score += 25;
-    } else if (timestampCount > 0) {
-      score += 10;
+    if (normalizedUrl.contains(normalizedQuery) && normalizedQuery.isNotEmpty) {
+      score += 15;
     }
     return score;
   }
 
-  String _buildLrcContent(_LyricsPageData page) {
-    if (!page.hasTimedLyrics) {
-      return '';
-    }
-
-    final buffer = StringBuffer()
-      ..writeln('[ti:${page.title}]')
-      ..writeln('[ar:${page.artist}]')
-      ..writeln('[by:geciyi.com]')
-      ..writeln();
-
-    final lineCount = page.timestamps.length < page.lyricLines.length
-        ? page.timestamps.length
-        : page.lyricLines.length;
-
-    for (int i = 0; i < lineCount; i++) {
-      final text = page.lyricLines[i].trim();
-      buffer.writeln('${page.timestamps[i]}$text');
-    }
-
-    return buffer.toString().trim();
+  bool _looksLikeVerificationPage(String body, {int? statusCode}) {
+    final loweredBody = body.toLowerCase();
+    return statusCode == 403 ||
+        loweredBody.contains('just a moment') ||
+        loweredBody.contains('performing security verification') ||
+        loweredBody.contains('enable javascript and cookies to continue') ||
+        loweredBody.contains('cf-browser-verification') ||
+        loweredBody.contains('cloudflare');
   }
 
   String _sanitizeFileName(String value) {
@@ -389,22 +647,31 @@ class LrcService {
   }
 }
 
-class _LyricsPageData {
-  const _LyricsPageData({
+class LyricsFetchException implements Exception {
+  const LyricsFetchException(
+    this.message, {
+    this.requiresVerification = false,
+    this.verificationUrl,
+  });
+
+  final String message;
+  final bool requiresVerification;
+  final String? verificationUrl;
+
+  @override
+  String toString() => message;
+}
+
+class _LyricsLinkCandidate {
+  const _LyricsLinkCandidate({
     required this.url,
     required this.title,
     required this.artist,
-    required this.lyricLines,
-    required this.timestamps,
     required this.score,
   });
 
   final String url;
   final String title;
   final String artist;
-  final List<String> lyricLines;
-  final List<String> timestamps;
   final int score;
-
-  bool get hasTimedLyrics => timestamps.isNotEmpty && lyricLines.isNotEmpty;
 }
