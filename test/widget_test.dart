@@ -14,5 +14,6 @@ void main() {
     expect(find.text('搜索导入歌词'), findsOneWidget);
     expect(find.text('本地导入 LRC'), findsOneWidget);
     expect(find.byIcon(Icons.search), findsOneWidget);
+    expect(find.byIcon(Icons.save_alt), findsOneWidget);
   });
 }

@@ -31,11 +31,12 @@ class HomePageState extends State<HomePage> {
   int _lyricOffsetMs = 0;
   bool _isRecording = false;
   bool _isSearching = false;
+  double? _dragSliderValue;
 
   @override
   void initState() {
     super.initState();
-    _recorderService.init();
+    _initializeRecorder();
     _audioPlayerService.positionStream.listen((position) {
       if (_lyrics.isEmpty) {
         return;
@@ -47,6 +48,13 @@ class HomePageState extends State<HomePage> {
         _lyricScrollService.scrollTo(newIndex, 60.0);
       }
     });
+  }
+
+  Future<void> _initializeRecorder() async {
+    final result = await _recorderService.init();
+    if (!result.success && mounted) {
+      _showMessage(result.message!);
+    }
   }
 
   @override
@@ -71,7 +79,7 @@ class HomePageState extends State<HomePage> {
       }
 
       final songIdentifier = _fileNameWithoutExtension(path);
-      setState(() => _songIdentifier = songIdentifier);
+      await _switchToNewAccompaniment(songIdentifier);
       _showMessage('已导入本地伴奏：$songIdentifier');
     } catch (error) {
       if (mounted) {
@@ -123,7 +131,7 @@ class HomePageState extends State<HomePage> {
         return;
       }
 
-      setState(() => _songIdentifier = detail.songIdentifier);
+      await _switchToNewAccompaniment(detail.songIdentifier);
       final qualityText = audioSource.usedHighQuality ? '高品质' : '标准音质';
       final warning = audioSource.warningMessage;
       _showMessage(
@@ -160,6 +168,151 @@ class HomePageState extends State<HomePage> {
         _showMessage('搜索导入歌词失败：$error');
       }
     }
+  }
+
+  Future<void> _exportMixedAudio() async {
+    if (!_audioPlayerService.hasAudioSource || _songIdentifier == null) {
+      _showMessage('请先导入伴奏后再导出');
+      return;
+    }
+
+    if (_audioPlayerService.isPlaying) {
+      await _audioPlayerService.pause();
+    }
+
+    final stopResult = await _recorderService.stopActiveSegment();
+    if (!stopResult.success) {
+      _showMessage(stopResult.message!);
+      return;
+    }
+
+    setState(() => _isRecording = false);
+
+    final accompanimentPath = await _audioPlayerService.prepareCurrentAudioForExport();
+    if (accompanimentPath == null) {
+      _showMessage('当前伴奏尚未准备好导出，请稍后再试');
+      return;
+    }
+
+    final duration = _audioPlayerService.duration;
+    if (duration == null) {
+      _showMessage('当前伴奏时长未知，暂时无法导出');
+      return;
+    }
+
+    final result = await _recorderService.exportMixedTrack(
+      exportBaseName: _songIdentifier!,
+      accompanimentPath: accompanimentPath,
+      accompanimentDuration: duration,
+    );
+
+    if (!mounted) {
+      return;
+    }
+
+    if (!result.success) {
+      _showMessage(result.message!);
+      return;
+    }
+
+    if (result.message != null) {
+      _showMessage('${result.message}：${result.filePath}');
+    } else {
+      _showMessage('混音导出完成：${result.filePath}');
+    }
+  }
+
+  Future<void> _togglePlayback() async {
+    if (!_audioPlayerService.hasAudioSource) {
+      _showMessage('请先导入伴奏');
+      return;
+    }
+
+    if (_audioPlayerService.isPlaying) {
+      await _audioPlayerService.pause();
+      final stopResult = await _recorderService.stopActiveSegment();
+      if (!stopResult.success && mounted) {
+        _showMessage(stopResult.message!);
+      }
+      if (mounted) {
+        setState(() => _isRecording = false);
+      }
+      return;
+    }
+
+    if (_songIdentifier != null) {
+      final startResult = await _recorderService.startSegment(
+        sessionName: _songIdentifier!,
+        startOffsetMs: _audioPlayerService.position.inMilliseconds,
+      );
+      if (!startResult.success) {
+        if (mounted) {
+          _showMessage(startResult.message!);
+        }
+        return;
+      }
+    }
+
+    await _audioPlayerService.play();
+    if (mounted) {
+      setState(() => _isRecording = _songIdentifier != null);
+    }
+  }
+
+  Future<void> _handleSeekEnd(double value) async {
+    final target = Duration(milliseconds: value.round());
+    final wasPlaying = _audioPlayerService.isPlaying;
+
+    if (wasPlaying) {
+      await _audioPlayerService.pause();
+      final stopResult = await _recorderService.stopActiveSegment();
+      if (!stopResult.success && mounted) {
+        _showMessage(stopResult.message!);
+      }
+    }
+
+    await _audioPlayerService.seek(target);
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _dragSliderValue = null;
+      _isRecording = false;
+    });
+
+    if (wasPlaying && _songIdentifier != null) {
+      final startResult = await _recorderService.startSegment(
+        sessionName: _songIdentifier!,
+        startOffsetMs: target.inMilliseconds,
+      );
+      if (!startResult.success) {
+        if (mounted) {
+          _showMessage(startResult.message!);
+        }
+        return;
+      }
+
+      await _audioPlayerService.play();
+      if (mounted) {
+        setState(() => _isRecording = true);
+      }
+    }
+  }
+
+  Future<void> _switchToNewAccompaniment(String songIdentifier) async {
+    await _audioPlayerService.stop();
+    await _recorderService.resetSession();
+    if (!mounted) {
+      return;
+    }
+
+    setState(() {
+      _songIdentifier = songIdentifier;
+      _isRecording = false;
+      _dragSliderValue = null;
+      _currentLyricIndex = -1;
+    });
   }
 
   Future<GequhaiSongDetail?> _searchSongDetail() async {
@@ -456,17 +609,21 @@ class HomePageState extends State<HomePage> {
                     position = duration;
                   }
 
+                  final sliderValue =
+                      _dragSliderValue ?? position.inMilliseconds.toDouble();
                   return Slider(
                     min: 0.0,
                     max: duration.inMilliseconds.toDouble(),
                     value: duration.inMilliseconds == 0
-                        ? 0
-                        : position.inMilliseconds.toDouble(),
+                        ? 0.0
+                        : sliderValue.clamp(
+                            0.0,
+                            duration.inMilliseconds.toDouble(),
+                          ),
                     onChanged: (value) {
-                      _audioPlayerService.seek(
-                        Duration(milliseconds: value.round()),
-                      );
+                      setState(() => _dragSliderValue = value);
                     },
+                    onChangeEnd: _handleSeekEnd,
                     activeColor: Colors.white,
                     inactiveColor: Colors.grey[700],
                   );
@@ -495,34 +652,15 @@ class HomePageState extends State<HomePage> {
                       color: Colors.white,
                     ),
                     iconSize: 64.0,
-                    onPressed: () async {
-                      if (playing) {
-                        await _audioPlayerService.pause();
-                        final path = await _recorderService.stopRecording();
-                        if (path != null && mounted) {
-                          _showMessage('录音已保存：$path');
-                        }
-                        if (mounted) {
-                          setState(() => _isRecording = false);
-                        }
-                      } else {
-                        await _audioPlayerService.play();
-                        if (_songIdentifier != null) {
-                          final recordingStarted =
-                              await _recorderService.startRecording(
-                            _songIdentifier!,
-                          );
-                          if (mounted) {
-                            setState(() => _isRecording = recordingStarted);
-                          }
-                          if (!recordingStarted && mounted) {
-                            _showMessage('录音未启动，请检查麦克风权限和保存目录');
-                          }
-                        }
-                      }
-                    },
+                    onPressed: _togglePlayback,
                   );
                 },
+              ),
+              IconButton(
+                icon: const Icon(Icons.save_alt, color: Colors.white),
+                iconSize: 36,
+                onPressed: _exportMixedAudio,
+                tooltip: '导出混音',
               ),
               PopupMenuButton<double>(
                 icon: const Icon(Icons.volume_up, color: Colors.white),
