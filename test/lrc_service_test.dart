@@ -26,7 +26,7 @@ void main() {
 
     expect(
       lrcService.extractFirstLyricsPageUrl(searchHtml),
-      'https://www.lyricsify.com/lyrics/artist-name/song-name',
+      'https://lyricsify.com/lyrics/artist-name/song-name',
     );
     expect(
       lrcService.extractLrcDownloadUrl(

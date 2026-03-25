@@ -23,7 +23,10 @@ class LrcService {
           ),
         );
 
-  static const String _baseUrl = 'https://www.lyricsify.com';
+  static const List<String> _baseUrls = <String>[
+    'https://lyricsify.com',
+    'https://www.lyricsify.com',
+  ];
   static final RegExp _timestampRegex = RegExp(
     r'\[(\d{1,2}):(\d{2})(?:[.:](\d{1,3}))?\]',
   );
@@ -34,13 +37,15 @@ class LrcService {
 
   final Dio _dio;
 
-  String buildSearchUrl(String query) {
+  String get _primaryBaseUrl => _baseUrls.first;
+
+  String buildSearchUrl(String query, {String? baseUrl}) {
     final normalizedQuery = query.trim();
     if (normalizedQuery.isEmpty) {
-      return _baseUrl;
+      return baseUrl ?? _primaryBaseUrl;
     }
 
-    return '$_baseUrl/search?q=${Uri.encodeQueryComponent(normalizedQuery)}';
+    return '${baseUrl ?? _primaryBaseUrl}/search?q=${Uri.encodeQueryComponent(normalizedQuery)}';
   }
 
   Future<String?> searchLrc(String songName, String artist) async {
@@ -50,35 +55,41 @@ class LrcService {
     }
 
     LyricsFetchException? verificationError;
+    LyricsFetchException? connectionError;
     for (final candidate in _buildCandidateQueries(query)) {
-      final searchUrl = buildSearchUrl(candidate);
-      try {
-        final html = await _requestPage(searchUrl);
-        if (html == null) {
-          continue;
-        }
+      for (final baseUrl in _baseUrls) {
+        final searchUrl = buildSearchUrl(candidate, baseUrl: baseUrl);
+        try {
+          final html = await _requestPage(searchUrl);
+          if (html == null) {
+            continue;
+          }
 
-        final matches = _extractLyricsLinks(html, candidate);
-        if (matches.isEmpty) {
-          continue;
-        }
+          final matches = _extractLyricsLinks(html, candidate);
+          if (matches.isEmpty) {
+            continue;
+          }
 
-        final bestMatch = matches.first;
-        debugPrint(
-          "Matched Lyricsify page '${bestMatch.title}' by '${bestMatch.artist}' -> ${bestMatch.url}",
-        );
-        return bestMatch.url;
-      } on LyricsFetchException catch (error) {
-        if (error.requiresVerification) {
-          verificationError ??= error;
-          break;
+          final bestMatch = matches.first;
+          debugPrint(
+            "Matched Lyricsify page '${bestMatch.title}' by '${bestMatch.artist}' -> ${bestMatch.url}",
+          );
+          return bestMatch.url;
+        } on LyricsFetchException catch (error) {
+          if (error.requiresVerification) {
+            verificationError ??= error;
+            break;
+          }
+          connectionError ??= error;
         }
-        rethrow;
       }
     }
 
     if (verificationError != null) {
       throw verificationError;
+    }
+    if (connectionError != null) {
+      throw connectionError;
     }
 
     debugPrint("No Lyricsify result found for query: $query");
@@ -178,7 +189,7 @@ class LrcService {
       return null;
     }
 
-    final baseUri = Uri.parse(currentUrl ?? _baseUrl);
+    final baseUri = Uri.parse(currentUrl ?? _primaryBaseUrl);
     return baseUri.resolve(rawHref).toString();
   }
 
@@ -221,32 +232,42 @@ class LrcService {
   }
 
   Future<String?> _requestPage(String url) async {
-    final response = await _dio.get<String>(
-      url,
-      options: Options(responseType: ResponseType.plain),
-    );
-    final body = response.data ?? '';
-
-    if (_looksLikeVerificationPage(body, statusCode: response.statusCode)) {
-      throw LyricsFetchException(
-        'Lyricsify 触发了人机验证，请在弹出的浏览器中完成验证后再导入。',
-        requiresVerification: true,
-        verificationUrl: url,
+    try {
+      final response = await _dio.get<String>(
+        url,
+        options: Options(responseType: ResponseType.plain),
       );
-    }
+      final body = response.data ?? '';
 
-    if (response.statusCode == 404) {
-      return null;
-    }
+      if (_looksLikeVerificationPage(body, statusCode: response.statusCode)) {
+        throw LyricsFetchException(
+          'Lyricsify 触发了人机验证，请在弹出的浏览器中完成验证后再导入。',
+          requiresVerification: true,
+          verificationUrl: url,
+        );
+      }
 
-    if (response.statusCode != 200) {
-      debugPrint(
-        'Lyricsify request failed with status ${response.statusCode}: $url',
-      );
-      return null;
-    }
+      if (response.statusCode == 404) {
+        return null;
+      }
 
-    return body;
+      if (response.statusCode != 200) {
+        debugPrint(
+          'Lyricsify request failed with status ${response.statusCode}: $url',
+        );
+        return null;
+      }
+
+      return body;
+    } on DioException catch (error) {
+      if (error.type == DioExceptionType.connectionError ||
+          error.error is SocketException) {
+        throw _buildConnectionException(url);
+      }
+      rethrow;
+    } on SocketException {
+      throw _buildConnectionException(url);
+    }
   }
 
   String _buildSearchQuery(String songName, String artist) {
@@ -319,7 +340,7 @@ class LrcService {
       final readableText = _stripHtml(anchorHtml);
 
       final candidate = _LyricsLinkCandidate(
-        url: Uri.parse(_baseUrl).resolve(relativeUrl).toString(),
+        url: Uri.parse(_primaryBaseUrl).resolve(relativeUrl).toString(),
         title: title.isEmpty ? readableText : title,
         artist: artist,
         score: _calculateMatchScore(
@@ -376,8 +397,10 @@ class LrcService {
       source
           .replaceAll(RegExp(r'<br\s*/?>', caseSensitive: false), '\n')
           .replaceAll(
-            RegExp(r'</(div|p|li|tr|section|article|pre|span|h\d)>',
-                caseSensitive: false),
+            RegExp(
+              r'</(div|p|li|tr|section|article|pre|span|h\d)>',
+              caseSensitive: false,
+            ),
             '\n',
           )
           .replaceAll(RegExp(r'<[^>]+>'), '\n')
@@ -412,7 +435,8 @@ class LrcService {
     required String artist,
   }) {
     final metadataLines = lines.where(_metadataRegex.hasMatch).toList();
-    final timedLines = lines.where((line) => _timestampRegex.hasMatch(line)).toList();
+    final timedLines =
+        lines.where((line) => _timestampRegex.hasMatch(line)).toList();
 
     final buffer = StringBuffer();
     final hasTitle = metadataLines.any(
@@ -512,8 +536,14 @@ class LrcService {
     for (final candidate in candidates) {
       final cleaned = candidate
           .replaceAll(RegExp(r'\s+LRC\s+Lyrics', caseSensitive: false), '')
-          .replaceAll(RegExp(r'\s*\|\s*Lyricsify.*$', caseSensitive: false), '')
-          .replaceAll(RegExp(r'\s+-\s+Lyricsify.*$', caseSensitive: false), '')
+          .replaceAll(
+            RegExp(r'\s*\|\s*Lyricsify.*$', caseSensitive: false),
+            '',
+          )
+          .replaceAll(
+            RegExp(r'\s+-\s+Lyricsify.*$', caseSensitive: false),
+            '',
+          )
           .trim();
       if (cleaned.isNotEmpty) {
         return cleaned;
@@ -530,8 +560,10 @@ class LrcService {
     }
 
     final title = _extractPageTitle(html);
-    final match = RegExp(r'^(.*?)\s+-\s+(.*?)\s+LRC\s+Lyrics$',
-        caseSensitive: false).firstMatch(title);
+    final match = RegExp(
+      r'^(.*?)\s+-\s+(.*?)\s+LRC\s+Lyrics$',
+      caseSensitive: false,
+    ).firstMatch(title);
     if (match != null) {
       return match.group(1)!.trim();
     }
@@ -540,7 +572,8 @@ class LrcService {
   }
 
   String _extractPageTitle(String html) {
-    final h1Match = RegExp(r'<h1[^>]*>(.*?)</h1>', dotAll: true).firstMatch(html);
+    final h1Match =
+        RegExp(r'<h1[^>]*>(.*?)</h1>', dotAll: true).firstMatch(html);
     if (h1Match != null) {
       final title = _stripHtml(h1Match.group(1)!);
       if (title.isNotEmpty) {
@@ -611,6 +644,14 @@ class LrcService {
         loweredBody.contains('enable javascript and cookies to continue') ||
         loweredBody.contains('cf-browser-verification') ||
         loweredBody.contains('cloudflare');
+  }
+
+  LyricsFetchException _buildConnectionException(String url) {
+    final host = Uri.tryParse(url)?.host ?? 'lyricsify.com';
+    return LyricsFetchException(
+      '无法连接到 $host。请检查当前网络和 DNS；如果你在 Android 上运行，还需要确认 '
+      'AndroidManifest 已声明 INTERNET 权限。',
+    );
   }
 
   String _sanitizeFileName(String value) {
