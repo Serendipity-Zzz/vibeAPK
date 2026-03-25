@@ -1,8 +1,12 @@
+import 'dart:ui' show DartPluginRegistrant;
 
 import 'package:flutter/material.dart';
+
 import 'pages/home_page.dart';
 
 void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  DartPluginRegistrant.ensureInitialized();
   runApp(const MyApp());
 }
 

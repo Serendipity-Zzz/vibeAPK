@@ -32,11 +32,14 @@ class HomePageState extends State<HomePage> {
   bool _isRecording = false;
   bool _isSearching = false;
   double? _dragSliderValue;
+  int _audioImportRevision = 0;
+  int _lyricsImportRevision = 0;
+  int _lastExportAudioRevision = -1;
+  int _lastExportLyricsRevision = -1;
 
   @override
   void initState() {
     super.initState();
-    _initializeRecorder();
     _audioPlayerService.positionStream.listen((position) {
       if (_lyrics.isEmpty) {
         return;
@@ -48,13 +51,6 @@ class HomePageState extends State<HomePage> {
         _lyricScrollService.scrollTo(newIndex, 60.0);
       }
     });
-  }
-
-  Future<void> _initializeRecorder() async {
-    final result = await _recorderService.init();
-    if (!result.success && mounted) {
-      _showMessage(result.message!);
-    }
   }
 
   @override
@@ -72,7 +68,6 @@ class HomePageState extends State<HomePage> {
       if (!mounted) {
         return;
       }
-
       if (path == null) {
         _showMessage('未选择伴奏文件');
         return;
@@ -80,6 +75,7 @@ class HomePageState extends State<HomePage> {
 
       final songIdentifier = _fileNameWithoutExtension(path);
       await _switchToNewAccompaniment(songIdentifier);
+      _songController.text = _normalizeSearchKeyword(songIdentifier);
       _showMessage('已导入本地伴奏：$songIdentifier');
     } catch (error) {
       if (mounted) {
@@ -132,12 +128,13 @@ class HomePageState extends State<HomePage> {
       }
 
       await _switchToNewAccompaniment(detail.songIdentifier);
+      _songController.text = detail.songIdentifier;
       final qualityText = audioSource.usedHighQuality ? '高品质' : '标准音质';
       final warning = audioSource.warningMessage;
       _showMessage(
         warning == null
             ? '已搜索导入$qualityText伴奏：${detail.songIdentifier}'
-            : '已导入伴奏：${detail.songIdentifier}；$warning',
+            : '已导入伴奏：${detail.songIdentifier}，$warning',
       );
     } catch (error) {
       if (mounted) {
@@ -163,6 +160,7 @@ class HomePageState extends State<HomePage> {
       }
 
       await _loadLyricsFromFile(detail.songIdentifier, lrcPath);
+      _songController.text = detail.songIdentifier;
     } catch (error) {
       if (mounted) {
         _showMessage('搜索导入歌词失败：$error');
@@ -173,6 +171,14 @@ class HomePageState extends State<HomePage> {
   Future<void> _exportMixedAudio() async {
     if (!_audioPlayerService.hasAudioSource || _songIdentifier == null) {
       _showMessage('请先导入伴奏后再导出');
+      return;
+    }
+    if (_lyrics.isEmpty) {
+      _showMessage('请先导入歌词后再导出');
+      return;
+    }
+    if (!_canExportCurrentSession) {
+      _showMessage('当前这次导入内容已经导出过一次，如需再次导出，请重新导入伴奏和歌词');
       return;
     }
 
@@ -188,7 +194,8 @@ class HomePageState extends State<HomePage> {
 
     setState(() => _isRecording = false);
 
-    final accompanimentPath = await _audioPlayerService.prepareCurrentAudioForExport();
+    final accompanimentPath =
+        await _audioPlayerService.prepareCurrentAudioForExport();
     if (accompanimentPath == null) {
       _showMessage('当前伴奏尚未准备好导出，请稍后再试');
       return;
@@ -215,6 +222,11 @@ class HomePageState extends State<HomePage> {
       return;
     }
 
+    setState(() {
+      _lastExportAudioRevision = _audioImportRevision;
+      _lastExportLyricsRevision = _lyricsImportRevision;
+    });
+
     if (result.message != null) {
       _showMessage('${result.message}：${result.filePath}');
     } else {
@@ -240,12 +252,16 @@ class HomePageState extends State<HomePage> {
       return;
     }
 
+    final startOffsetMs = _audioPlayerService.position.inMilliseconds;
+    await _audioPlayerService.play();
+
     if (_songIdentifier != null) {
       final startResult = await _recorderService.startSegment(
         sessionName: _songIdentifier!,
-        startOffsetMs: _audioPlayerService.position.inMilliseconds,
+        startOffsetMs: startOffsetMs,
       );
       if (!startResult.success) {
+        await _audioPlayerService.pause();
         if (mounted) {
           _showMessage(startResult.message!);
         }
@@ -253,7 +269,6 @@ class HomePageState extends State<HomePage> {
       }
     }
 
-    await _audioPlayerService.play();
     if (mounted) {
       setState(() => _isRecording = _songIdentifier != null);
     }
@@ -282,18 +297,19 @@ class HomePageState extends State<HomePage> {
     });
 
     if (wasPlaying && _songIdentifier != null) {
+      await _audioPlayerService.play();
       final startResult = await _recorderService.startSegment(
         sessionName: _songIdentifier!,
         startOffsetMs: target.inMilliseconds,
       );
       if (!startResult.success) {
+        await _audioPlayerService.pause();
         if (mounted) {
           _showMessage(startResult.message!);
         }
         return;
       }
 
-      await _audioPlayerService.play();
       if (mounted) {
         setState(() => _isRecording = true);
       }
@@ -309,9 +325,12 @@ class HomePageState extends State<HomePage> {
 
     setState(() {
       _songIdentifier = songIdentifier;
+      _lyrics = <LyricLine>[];
+      _lyricOffsetMs = 0;
       _isRecording = false;
       _dragSliderValue = null;
       _currentLyricIndex = -1;
+      _audioImportRevision++;
     });
   }
 
@@ -363,17 +382,38 @@ class HomePageState extends State<HomePage> {
       _lyricOffsetMs = offset;
       _songIdentifier = songName;
       _currentLyricIndex = -1;
+      _lyricsImportRevision++;
     });
     _lyricScrollService.applyOffset(_lyrics, _lyricOffsetMs);
     _showMessage('已导入歌词：$songName');
   }
 
+  bool get _canExportCurrentSession =>
+      _audioImportRevision > _lastExportAudioRevision &&
+      _lyricsImportRevision > _lastExportLyricsRevision;
+
   String _currentSearchKeyword() {
-    final text = _songController.text.trim();
+    final text = _normalizeSearchKeyword(_songController.text);
     if (text.isNotEmpty) {
       return text;
     }
-    return _songIdentifier ?? '';
+    return _normalizeSearchKeyword(_songIdentifier ?? '');
+  }
+
+  String _normalizeSearchKeyword(String raw) {
+    return raw
+        .replaceAll(RegExp(r'\[[^\]]*\]|\([^)]+\)|（[^）]+）'), ' ')
+        .replaceAll(
+          RegExp(
+            r'\b(320k|128k|flac|wav|ape|hi-?res|无损|高品质|伴奏|原版|完整版|live|dj版?)\b',
+            caseSensitive: false,
+          ),
+          ' ',
+        )
+        .replaceAll(RegExp(r'[_]+'), ' ')
+        .replaceAll(RegExp(r'\s+-\s+'), ' ')
+        .replaceAll(RegExp(r'\s+'), ' ')
+        .trim();
   }
 
   String _fileNameWithoutExtension(String path) {
@@ -393,11 +433,11 @@ class HomePageState extends State<HomePage> {
   }
 
   int _findCurrentLyricIndex(int milliseconds) {
-    for (int i = 0; i < _lyrics.length; i++) {
-      if (milliseconds >= _lyrics[i].timestamp) {
-        if (i + 1 >= _lyrics.length ||
-            milliseconds < _lyrics[i + 1].timestamp) {
-          return i;
+    for (int index = 0; index < _lyrics.length; index++) {
+      if (milliseconds >= _lyrics[index].timestamp) {
+        if (index + 1 >= _lyrics.length ||
+            milliseconds < _lyrics[index + 1].timestamp) {
+          return index;
         }
       }
     }

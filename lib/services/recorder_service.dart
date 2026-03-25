@@ -1,7 +1,7 @@
 import 'dart:io';
+import 'dart:math' as math;
+import 'dart:typed_data';
 
-import 'package:ffmpeg_kit_flutter_minimal/ffmpeg_kit.dart';
-import 'package:ffmpeg_kit_flutter_minimal/return_code.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:path_provider/path_provider.dart';
@@ -21,28 +21,21 @@ class RecorderService {
   bool get hasRecordedContent =>
       _segments.isNotEmpty || _activeSegmentPath != null;
 
-  bool get supportsMixedExport =>
-      !kIsWeb &&
-      (Platform.isAndroid ||
-          Platform.isIOS ||
-          Platform.isMacOS ||
-          Platform.isWindows ||
-          Platform.isLinux);
+  bool get supportsMixedExport => !kIsWeb;
 
   Future<RecorderActionResult> init() async {
     if (_isInitialized) {
       return const RecorderActionResult.success();
     }
 
-    final permissionsResult = await _ensureMicrophonePermission();
-    if (!permissionsResult.success) {
-      return permissionsResult;
+    final permissionResult = await _ensureMicrophonePermission();
+    if (!permissionResult.success) {
+      return permissionResult;
     }
 
     try {
       await _recorder.openRecorder();
       _isInitialized = true;
-      debugPrint('Recorder service initialized.');
       return const RecorderActionResult.success();
     } catch (error) {
       debugPrint('Failed to initialize recorder service: $error');
@@ -73,7 +66,6 @@ class RecorderService {
       if (recordingsDir == null) {
         return const RecorderActionResult.failure('无法创建录音目录');
       }
-
       if (!await recordingsDir.exists()) {
         await recordingsDir.create(recursive: true);
       }
@@ -90,9 +82,6 @@ class RecorderService {
 
       _activeSegmentPath = segmentPath;
       _activeSegmentStartMs = startOffsetMs;
-      debugPrint(
-        'Recording segment started at $startOffsetMs ms -> $segmentPath',
-      );
       return const RecorderActionResult.success();
     } catch (error) {
       debugPrint('Failed to start recording: $error');
@@ -116,13 +105,9 @@ class RecorderService {
 
       if (path != null && startOffsetMs != null) {
         _segments.add(
-          RecordedSegment(
-            filePath: path,
-            startOffsetMs: startOffsetMs,
-          ),
+          RecordedSegment(filePath: path, startOffsetMs: startOffsetMs),
         );
       }
-
       return const RecorderActionResult.success();
     } catch (error) {
       debugPrint('Failed to stop recording: $error');
@@ -150,6 +135,12 @@ class RecorderService {
       return const RecorderExportResult.failure('当前平台暂不支持导出混音文件');
     }
 
+    if (!_isWavFile(accompanimentPath)) {
+      return const RecorderExportResult.failure(
+        '当前桌面端仅支持导出 WAV 伴奏。请重新导入 WAV 格式伴奏后再导出。',
+      );
+    }
+
     final exportDir = await _resolveExportDirectory();
     if (exportDir == null) {
       return const RecorderExportResult.failure('无法创建导出目录');
@@ -159,21 +150,44 @@ class RecorderService {
     }
 
     final safeName = _sanitizeFileName(exportBaseName);
-    final outputPath = '${exportDir.path}/$safeName.m4a';
-    final command = _buildExportCommand(
-      accompanimentPath: accompanimentPath,
-      accompanimentDuration: accompanimentDuration,
-      outputPath: outputPath,
-    );
+    final outputPath = '${exportDir.path}/$safeName.wav';
 
     try {
-      final session = await FFmpegKit.execute(command);
-      final returnCode = await session.getReturnCode();
-      if (!ReturnCode.isSuccess(returnCode)) {
-        final logs = await session.getAllLogsAsString();
-        debugPrint('FFmpeg export failed: $logs');
-        return const RecorderExportResult.failure('导出混音失败');
+      final accompanimentData = await _readWavFile(accompanimentPath);
+      final expectedSamples = math.min(
+        accompanimentData.samples.length,
+        ((accompanimentDuration.inMicroseconds *
+                    accompanimentData.sampleRate) ~/
+                1000000) *
+            accompanimentData.channels,
+      );
+      final mixedSamples = Int16List.fromList(
+        accompanimentData.samples.take(expectedSamples).toList(),
+      );
+
+      for (final segment in _segments) {
+        final segmentFile = File(segment.filePath);
+        if (!await segmentFile.exists() || !_isWavFile(segment.filePath)) {
+          continue;
+        }
+
+        final segmentData = await _readWavFile(segment.filePath);
+        _mixSegment(
+          targetSamples: mixedSamples,
+          sourceSamples: segmentData.samples,
+          startOffsetMs: segment.startOffsetMs,
+          sampleRate: accompanimentData.sampleRate,
+          channels: accompanimentData.channels,
+        );
       }
+
+      await _writeWavFile(
+        outputPath: outputPath,
+        sampleRate: accompanimentData.sampleRate,
+        channels: accompanimentData.channels,
+        bitDepth: accompanimentData.bitDepth,
+        samples: mixedSamples,
+      );
 
       return RecorderExportResult.success(
         outputPath,
@@ -185,70 +199,141 @@ class RecorderService {
     }
   }
 
-  String _buildExportCommand({
-    required String accompanimentPath,
-    required Duration accompanimentDuration,
-    required String outputPath,
-  }) {
-    final inputArgs = <String>[
-      '-y',
-      '-i',
-      _quoteArg(accompanimentPath),
-    ];
-
-    if (_segments.isEmpty) {
-      return [
-        ...inputArgs,
-        '-t',
-        accompanimentDuration.inMilliseconds / 1000.0,
-        '-c:a',
-        'aac',
-        '-b:a',
-        '192k',
-        _quoteArg(outputPath),
-      ].join(' ');
+  Future<_WavFileData> _readWavFile(String path) async {
+    final bytes = await File(path).readAsBytes();
+    if (bytes.length < 44) {
+      throw Exception('WAV 文件长度不合法');
     }
 
-    final filterParts = <String>[];
-    final mixInputs = <String>['[0:a]'];
-
-    for (int index = 0; index < _segments.length; index++) {
-      final segment = _segments[index];
-      inputArgs
-        ..add('-i')
-        ..add(_quoteArg(segment.filePath));
-      final label = 'v$index';
-      filterParts.add(
-        '[${index + 1}:a]adelay=${segment.startOffsetMs}|${segment.startOffsetMs},aresample=async=1[$label]',
-      );
-      mixInputs.add('[$label]');
+    final byteData = bytes.buffer.asByteData();
+    if (_chunkId(byteData, 0) != 'RIFF' || _chunkId(byteData, 8) != 'WAVE') {
+      throw Exception('音频文件不是有效的 WAV');
     }
 
-    filterParts.add(
-      '${mixInputs.join()}amix=inputs=${mixInputs.length}:duration=first:dropout_transition=0[mix]',
+    int channels = 0;
+    int sampleRate = 0;
+    int bitDepth = 0;
+    int? dataOffset;
+    int? dataSize;
+    int offset = 12;
+
+    while (offset + 8 <= bytes.length) {
+      final chunkId = _chunkId(byteData, offset);
+      final chunkSize = byteData.getUint32(offset + 4, Endian.little);
+      final chunkDataOffset = offset + 8;
+
+      if (chunkId == 'fmt ') {
+        final format = byteData.getUint16(chunkDataOffset, Endian.little);
+        if (format != 1) {
+          throw Exception('仅支持 PCM WAV 文件');
+        }
+        channels = byteData.getUint16(chunkDataOffset + 2, Endian.little);
+        sampleRate = byteData.getUint32(chunkDataOffset + 4, Endian.little);
+        bitDepth = byteData.getUint16(chunkDataOffset + 14, Endian.little);
+      } else if (chunkId == 'data') {
+        dataOffset = chunkDataOffset;
+        dataSize = chunkSize;
+        break;
+      }
+
+      offset = chunkDataOffset + chunkSize + (chunkSize.isOdd ? 1 : 0);
+    }
+
+    if (channels <= 0 || sampleRate <= 0 || bitDepth != 16) {
+      throw Exception('WAV 参数无法解析或格式不受支持');
+    }
+    if (dataOffset == null || dataSize == null) {
+      throw Exception('WAV 缺少 PCM 数据块');
+    }
+
+    final sampleCount = dataSize ~/ 2;
+    final samples = Int16List(sampleCount);
+    final pcmData = bytes.buffer.asByteData(dataOffset, dataSize);
+    for (int index = 0; index < sampleCount; index++) {
+      samples[index] = pcmData.getInt16(index * 2, Endian.little);
+    }
+
+    return _WavFileData(
+      sampleRate: sampleRate,
+      channels: channels,
+      bitDepth: bitDepth,
+      samples: samples,
     );
-
-    final durationSeconds = accompanimentDuration.inMilliseconds / 1000.0;
-
-    return [
-      ...inputArgs,
-      '-filter_complex',
-      _quoteArg(filterParts.join(';')),
-      '-map',
-      _quoteArg('[mix]'),
-      '-t',
-      durationSeconds.toString(),
-      '-c:a',
-      'aac',
-      '-b:a',
-      '192k',
-      _quoteArg(outputPath),
-    ].join(' ');
   }
 
-  String _quoteArg(String value) {
-    final escaped = value.replaceAll('"', r'\"');
-    return '"$escaped"';
+  Future<void> _writeWavFile({
+    required String outputPath,
+    required int sampleRate,
+    required int channels,
+    required int bitDepth,
+    required Int16List samples,
+  }) async {
+    if (bitDepth != 16) {
+      throw Exception('暂时仅支持 16-bit WAV 导出');
+    }
+
+    final dataSize = samples.length * 2;
+    final bytes = Uint8List(44 + dataSize);
+    final byteData = ByteData.sublistView(bytes);
+
+    _writeChunkId(byteData, 0, 'RIFF');
+    byteData.setUint32(4, 36 + dataSize, Endian.little);
+    _writeChunkId(byteData, 8, 'WAVE');
+    _writeChunkId(byteData, 12, 'fmt ');
+    byteData.setUint32(16, 16, Endian.little);
+    byteData.setUint16(20, 1, Endian.little);
+    byteData.setUint16(22, channels, Endian.little);
+    byteData.setUint32(24, sampleRate, Endian.little);
+    final blockAlign = channels * (bitDepth ~/ 8);
+    byteData.setUint32(28, sampleRate * blockAlign, Endian.little);
+    byteData.setUint16(32, blockAlign, Endian.little);
+    byteData.setUint16(34, bitDepth, Endian.little);
+    _writeChunkId(byteData, 36, 'data');
+    byteData.setUint32(40, dataSize, Endian.little);
+
+    for (int index = 0; index < samples.length; index++) {
+      byteData.setInt16(44 + (index * 2), samples[index], Endian.little);
+    }
+
+    await File(outputPath).writeAsBytes(bytes, flush: true);
+  }
+
+  void _mixSegment({
+    required Int16List targetSamples,
+    required Int16List sourceSamples,
+    required int startOffsetMs,
+    required int sampleRate,
+    required int channels,
+  }) {
+    final startFrame = ((startOffsetMs * sampleRate) / 1000).round();
+    final startSampleIndex = startFrame * channels;
+
+    for (int index = 0; index < sourceSamples.length; index++) {
+      final targetIndex = startSampleIndex + index;
+      if (targetIndex >= targetSamples.length) {
+        break;
+      }
+
+      final mixed = targetSamples[targetIndex] + sourceSamples[index];
+      targetSamples[targetIndex] = mixed.clamp(-32768, 32767).toInt();
+    }
+  }
+
+  bool _isWavFile(String path) {
+    final lowerPath = path.toLowerCase();
+    return lowerPath.endsWith('.wav') || lowerPath.endsWith('.wave');
+  }
+
+  String _chunkId(ByteData data, int offset) {
+    return String.fromCharCodes(
+      List<int>.generate(4, (index) => data.getUint8(offset + index)),
+    );
+  }
+
+  void _writeChunkId(ByteData data, int offset, String value) {
+    for (int index = 0; index < 4; index++) {
+      data.setUint8(offset + index, value.codeUnitAt(index));
+    }
   }
 
   Future<RecorderActionResult> _ensureMicrophonePermission() async {
@@ -363,4 +448,18 @@ class RecordedSegment {
 
   final String filePath;
   final int startOffsetMs;
+}
+
+class _WavFileData {
+  const _WavFileData({
+    required this.sampleRate,
+    required this.channels,
+    required this.bitDepth,
+    required this.samples,
+  });
+
+  final int sampleRate;
+  final int channels;
+  final int bitDepth;
+  final Int16List samples;
 }

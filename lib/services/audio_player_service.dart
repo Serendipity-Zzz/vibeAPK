@@ -5,6 +5,20 @@ import 'package:flutter/foundation.dart';
 import 'package:just_audio/just_audio.dart';
 
 class AudioPlayerService {
+  static const List<String> _supportedAudioExtensions = <String>[
+    'mp3',
+    'wav',
+    'flac',
+    'm4a',
+    'aac',
+    'ogg',
+    'oga',
+    'opus',
+    'wma',
+    'aiff',
+    'aif',
+  ];
+
   AudioPlayerService()
       : _audioPlayer = AudioPlayer(
           userAgent:
@@ -41,11 +55,14 @@ class AudioPlayerService {
 
     final FilePickerResult? result;
     try {
-      result = await FilePicker.platform.pickFiles(type: FileType.audio);
+      result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: _supportedAudioExtensions,
+      );
     } catch (error, stackTrace) {
       debugPrint('Failed to open file picker: $error');
       debugPrint('$stackTrace');
-      throw Exception('无法打开文件选择器');
+      throw Exception('无法打开伴奏文件选择器');
     }
 
     if (result == null || result.files.single.path == null) {
