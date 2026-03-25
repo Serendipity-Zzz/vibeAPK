@@ -12,10 +12,10 @@ class HomePage extends StatefulWidget {
   const HomePage({super.key});
 
   @override
-  _HomePageState createState() => _HomePageState();
+  HomePageState createState() => HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class HomePageState extends State<HomePage> {
   final AudioPlayerService _audioPlayerService = AudioPlayerService();
   final LrcService _lrcService = LrcService();
   final LyricScrollService _lyricScrollService = LyricScrollService();
@@ -289,19 +289,19 @@ class _HomePageState extends State<HomePage> {
                   return IconButton(
                     icon: Icon(playing ? Icons.pause_circle_filled : Icons.play_circle_filled, color: Colors.white),
                     iconSize: 64.0,
-                    onPressed: () {
+                    onPressed: () async {
                       if (playing) {
                         _audioPlayerService.pause();
-                        _recorderService.stopRecording().then((path) {
-                          if (path != null && mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('录音已保存: $path')));
-                          }
-                        });
+                        final path = await _recorderService.stopRecording();
+                        if (path != null && mounted) {
+                          // ignore: use_build_context_synchronously
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('录音已保存: $path')));
+                        }
                         setState(() => _isRecording = false);
                       } else {
                         _audioPlayerService.play();
                         if (_songIdentifier != null) {
-                          _recorderService.startRecording(_songIdentifier!);
+                          await _recorderService.startRecording(_songIdentifier!);
                           setState(() => _isRecording = true);
                         }
                       }

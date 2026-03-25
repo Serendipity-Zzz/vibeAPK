@@ -46,8 +46,10 @@ class AudioPlayerService {
         debugPrint("File picker was cancelled or failed."); // 调试信息
         return null;
       }
-    } catch (e) {
-      debugPrint("Error picking or loading file: $e"); // 调试信息
+    } catch (e, stackTrace) {
+      // 捕获所有类型的异常，并打印详细信息
+      debugPrint("Error picking or loading file: $e");
+      debugPrint("Stack trace: $stackTrace");
       return null;
     }
   }
