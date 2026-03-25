@@ -5,6 +5,10 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+dependencies {
+    implementation("com.google.android.material:material:1.12.0")
+}
+
 android {
     namespace = "com.example.karaoke_app"
     compileSdk = flutter.compileSdkVersion
