@@ -109,23 +109,23 @@ class HomePageState extends State<HomePage> {
     }
 
     try {
-      final downloadResult = await _gequhaiService.downloadAndSaveAudio(
-        detail,
-        fileName: detail.songIdentifier,
-      );
-      if (downloadResult == null) {
+      final audioSource = await _gequhaiService.resolveAudioSource(detail);
+      if (audioSource == null) {
         _showMessage('未获取到可导入的伴奏音频');
         return;
       }
 
-      await _audioPlayerService.loadAudioFromPath(downloadResult.filePath);
+      await _audioPlayerService.loadAudioFromUrl(
+        audioSource.audioUrl,
+        headers: audioSource.headers,
+      );
       if (!mounted) {
         return;
       }
 
       setState(() => _songIdentifier = detail.songIdentifier);
-      final qualityText = downloadResult.usedHighQuality ? '高品质' : '标准音质';
-      final warning = downloadResult.warningMessage;
+      final qualityText = audioSource.usedHighQuality ? '高品质' : '标准音质';
+      final warning = audioSource.warningMessage;
       _showMessage(
         warning == null
             ? '已搜索导入$qualityText伴奏：${detail.songIdentifier}'

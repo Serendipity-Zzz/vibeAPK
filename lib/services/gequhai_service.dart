@@ -199,6 +199,28 @@ class GequhaiService {
     );
   }
 
+  Future<GequhaiAudioSourceResult?> resolveAudioSource(
+    GequhaiSongDetail detail,
+  ) async {
+    final resolved = await _resolveAudioCandidate(detail);
+    if (resolved == null) {
+      return null;
+    }
+
+    return GequhaiAudioSourceResult(
+      audioUrl: resolved.audioUrl,
+      usedHighQuality: resolved.usedHighQuality,
+      warningMessage: resolved.warningMessage,
+      headers: <String, String>{
+        HttpHeaders.rangeHeader: 'bytes=0-',
+        HttpHeaders.userAgentHeader:
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+            'AppleWebKit/537.36 (KHTML, like Gecko) '
+            'Chrome/145.0.0.0 Safari/537.36',
+      },
+    );
+  }
+
   Future<_ResolvedAudioCandidate?> _resolveAudioCandidate(
     GequhaiSongDetail detail,
   ) async {
@@ -592,6 +614,20 @@ class GequhaiAudioDownloadResult {
   final String filePath;
   final bool usedHighQuality;
   final String? warningMessage;
+}
+
+class GequhaiAudioSourceResult {
+  const GequhaiAudioSourceResult({
+    required this.audioUrl,
+    required this.usedHighQuality,
+    this.warningMessage,
+    this.headers,
+  });
+
+  final String audioUrl;
+  final bool usedHighQuality;
+  final String? warningMessage;
+  final Map<String, String>? headers;
 }
 
 class _DirectAudioUrl {

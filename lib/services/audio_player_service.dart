@@ -50,6 +50,20 @@ class AudioPlayerService {
     }
   }
 
+  Future<void> loadAudioFromUrl(
+    String url, {
+    Map<String, String>? headers,
+  }) async {
+    try {
+      await _audioPlayer.setUrl(url, headers: headers);
+      debugPrint('Audio URL set successfully: $url');
+    } catch (error, stackTrace) {
+      debugPrint('Failed to load audio url: $error');
+      debugPrint('$stackTrace');
+      throw Exception('搜索到的伴奏音频暂时无法播放');
+    }
+  }
+
   Future<void> play() async {
     await _audioPlayer.play();
   }
