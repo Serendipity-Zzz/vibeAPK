@@ -1,4 +1,3 @@
-
 name: Build Flutter Android APK
 
 on:
@@ -12,27 +11,29 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Java
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: 'zulu'
-          java-version: '11'
+          java-version: '17'  # 升级为兼容新版Gradle的Java 17
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: 'stable' # 或者根据你的项目选择 'beta', 'dev', 'master'
+          channel: 'stable'
 
       - name: Install dependencies
         run: flutter pub get
 
+      # 加入你之前需要的跳过校验参数，解决flutter_sound报错
       - name: Build APK
-        run: flutter build apk --release
+        run: flutter build apk --release --android-skip-build-dependency-validation
 
+      # 修复：v3 → v4 解决弃用报错
       - name: Upload APK artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
