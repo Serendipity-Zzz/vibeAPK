@@ -1,6 +1,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
+import 'package:permission_handler/permission_handler.dart';
 import '../services/audio_player_service.dart';
 import '../services/lrc_service.dart';
 import '../services/lyric_scroll_service.dart';
@@ -49,6 +50,34 @@ class _HomePageState extends State<HomePage> {
     _recorderService.dispose();
     _songController.dispose();
     super.dispose();
+  }
+
+  /// 带权限检查的音频文件选择
+  Future<void> _pickAudioWithPermissions() async {
+    // 检查并请求权限
+    var status = await Permission.audio.request();
+    // 对于旧版 Android，如果 audio 权限不可用，则回退到 storage 权限
+    if (!status.isGranted) {
+      status = await Permission.storage.request();
+    }
+
+    if (status.isGranted) {
+      // 权限被授予，执行文件选择
+      final path = await _audioPlayerService.pickAndLoadAudio();
+      if (path != null) {
+        setState(() => _songIdentifier = path.split('/').last.split('.').first);
+      }
+    } else if (status.isPermanentlyDenied) {
+      // 如果权限被永久拒绝，引导用户到设置中开启
+      openAppSettings();
+    } else {
+      // 权限被拒绝
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('需要存储权限才能导入伴奏')),
+        );
+      }
+    }
   }
 
   int _findCurrentLyricIndex(int milliseconds) {
@@ -103,7 +132,6 @@ class _HomePageState extends State<HomePage> {
                     onChanged: (value) {
                       setModalState(() => _lyricOffsetMs = value.round());
                       _lyricScrollService.applyOffset(_lyrics, _lyricOffsetMs);
-                      // 主界面状态也需要更新以重绘歌词
                       setState(() {});
                     },
                   ),
@@ -168,12 +196,7 @@ class _HomePageState extends State<HomePage> {
           ElevatedButton.icon(
             icon: const Icon(Icons.music_note),
             label: const Text('导入伴奏'),
-            onPressed: () async {
-              final path = await _audioPlayerService.pickAndLoadAudio();
-              if (path != null) {
-                setState(() => _songIdentifier = path.split('/').last.split('.').first);
-              }
-            },
+            onPressed: _pickAudioWithPermissions, // 使用新的带权限检查的方法
           ),
           const SizedBox(width: 10),
           Expanded(
